@@ -98,7 +98,7 @@ class KSPLiftoffEnv(gym.Env):
         
         # 1. The Breadcrumb Trail 
         alt_gained = alt - self.last_alt
-        reward += alt_gained * 0.5  
+        reward += alt_gained * 2.0 
         self.last_alt = alt
         
         # 2. The Ultimate Goal
@@ -132,7 +132,7 @@ class KSPLiftoffEnv(gym.Env):
             
         # 5. Coward Penalty
         elif not self.has_launched:
-            reward -= 2
+            reward -= 50
 
         # Timeout 
         if self.current_step > 1500: 
@@ -144,8 +144,8 @@ class KSPLiftoffEnv(gym.Env):
 if __name__ == "__main__":
     env = KSPLiftoffEnv()
     
-    print("Initializing Liftoff Brain...")
-    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
+    print("Loading existing brain...")
+    model = PPO.load("./saved_brains/liftoff_model_5000_steps", env=env)
     
     checkpoint_callback = CheckpointCallback(
         save_freq=5000, 
