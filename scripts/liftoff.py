@@ -29,6 +29,10 @@ class KSPLiftoffEnv(gym.Env):
         self.ref_frame = self.vessel.orbit.body.reference_frame
         self.flight = self.vessel.flight(self.ref_frame)
         
+        # Crash detection trackers
+        self.surface_flight = self.vessel.flight(self.vessel.surface_reference_frame)
+        self.start_parts = len(self.vessel.parts.all)
+        
         # Engine OFF.
         self.vessel.control.throttle = 0.0
         
@@ -49,18 +53,39 @@ class KSPLiftoffEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
         
-        self.vessel.control.throttle = float(action[0])
-        
-        if float(action[1]) > 0.8:
-            if (time.time() - self.last_stage_time) > 2.0:
-                self.vessel.control.activate_next_stage()
-                self.last_stage_time = time.time()
+        # --- NEW: THE EXPLOSION CATCHER ---
+        # We wrap all physical interactions in a try/except block.
+        try:
+            self.vessel.control.throttle = float(action[0])
+            
+            if float(action[1]) > 0.8:
+                if (time.time() - self.last_stage_time) > 2.0:
+                    self.vessel.control.activate_next_stage()
+                    self.last_stage_time = time.time()
+                    print(">>> AI TRIGGERED STAGING! <<<")
+                    
+                    time.sleep(0.2) 
+                    self.start_parts = len(self.vessel.parts.all)
 
-        time.sleep(0.1)
+            # Physics Tick
+            time.sleep(0.1)
 
-        obs = self._get_obs()
-        alt = obs[0]
-        vel = obs[1]
+            obs = self._get_obs()
+            alt = obs[0]
+            vel = obs[1]
+
+            # Grab telemetry for the crash checks
+            current_parts = len(self.vessel.parts.all)
+            pitch = self.surface_flight.pitch 
+            mean_alt = self.flight.mean_altitude 
+            
+        except Exception as e:
+            # If ANY of the above code fails, the ship no longer exists!
+            print(">>> CATASTROPHIC EXPLOSION DETECTED! <<<")
+            # Return a dummy observation, massive penalty, and force a reset
+            return np.array([0.0, 0.0], dtype=np.float32), -1000, True, False, {}
+
+        # -----------------------------------
 
         reward = 0
         terminated = False
@@ -71,27 +96,45 @@ class KSPLiftoffEnv(gym.Env):
 
         # --- THE REWARD MATH ---
         
-        # 1. The Breadcrumb Trail (Points for going UP, minus points for falling DOWN)
+        # 1. The Breadcrumb Trail 
         alt_gained = alt - self.last_alt
-        reward += alt_gained * 0.5  # 0.5 points for every meter climbed!
+        reward += alt_gained * 0.5  
         self.last_alt = alt
         
         # 2. The Ultimate Goal
         if alt >= 10000:
             print(f"TARGET REACHED! 10km crossed in {self.current_step} steps.")
-            reward += 2000 # Jackpot for finishing the ascent mission!
+            reward += 2000 
             terminated = True
             
-        # 3. Crash / Explosion check (Only checks if it actually left the pad first)
+        # 3a. Broken Part Check
+        elif current_parts < self.start_parts:
+            print(">>> CRAFT BROKE APART! <<<")
+            reward -= 1000
+            terminated = True
+            
+        # 3b. Tip-Over Check 
+        elif pitch < 60 and alt < 100:
+            print(">>> ROCKET TIPPED OVER! <<<")
+            reward -= 1000
+            terminated = True
+            
+        # 3c. The Ocean Trap Check
+        elif mean_alt < 10 and self.has_launched and self.current_step > 50:
+            print(">>> SPLASHDOWN IN THE OCEAN! <<<")
+            reward -= 1000
+            terminated = True
+            
+        # 4. Normal crash check (on solid ground)
         elif alt < 15 and self.has_launched and self.current_step > 50:
             reward -= 1000
             terminated = True
             
-        # 4. Coward Penalty
+        # 5. Coward Penalty
         elif not self.has_launched:
-            reward -= 2 # Stop sitting on the pad!
+            reward -= 2
 
-        # Timeout (It shouldn't take more than ~3 minutes to reach 10km)
+        # Timeout 
         if self.current_step > 1500: 
             truncated = True 
 
