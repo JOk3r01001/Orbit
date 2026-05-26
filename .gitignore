@@ -1,0 +1,14 @@
+#environment
+ksp_env/
+
+#logs
+logs/
+
+#data
+data/
+
+#models
+models/
+
+#results
+results/
