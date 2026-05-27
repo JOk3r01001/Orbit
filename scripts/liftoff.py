@@ -74,19 +74,15 @@ class KSPLiftoffEnv(gym.Env):
             reward += 2000 
             terminated = True
         elif current_parts < self.start_parts:
-            print(">>> CRAFT BROKE APART! <<<")
             reward -= 1000
             terminated = True
         elif pitch < 60 and alt < 100:
-            print(">>> ROCKET TIPPED OVER! <<<")
             reward -= 1000
             terminated = True
         elif mean_alt < 10 and self.has_launched and self.current_step > 50:
-            print(">>> SPLASHDOWN IN THE OCEAN! <<<")
             reward -= 1000
             terminated = True
         elif alt < 15 and self.has_launched and self.current_step > 50:
-            print(">>> CRASHED INTO GROUND! <<<")
             reward -= 1000
             terminated = True
         elif not self.has_launched:
@@ -103,6 +99,22 @@ class KSPLiftoffEnv(gym.Env):
 
 if __name__ == "__main__":
     env = KSPLiftoffEnv()
-    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
-    model.learn(total_timesteps=80000) 
-    model.save("liftoff_bot_fuel_aware_final")
+    
+    # IMPLEMENTING DENSER NETWORK
+    # We increase the hidden layers to 128 neurons each to handle the complex state space
+    policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
+    
+    model = PPO("MlpPolicy", env, 
+                policy_kwargs=policy_kwargs, 
+                verbose=1, 
+                device="cpu")
+    
+    checkpoint_callback = CheckpointCallback(
+        save_freq=5000, 
+        save_path='./saved_brains/', 
+        name_prefix='liftoff_dense_model'
+    )
+    
+    print("Starting Training with Denser Brain...")
+    model.learn(total_timesteps=80000, callback=checkpoint_callback) 
+    model.save("liftoff_dense_brain_final")
