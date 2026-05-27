@@ -23,6 +23,12 @@ class KSPLiftoffEnv(gym.Env):
         self.flight = self.vessel.flight(self.ref_frame)
         self.surface_flight = self.vessel.flight(self.vessel.surface_reference_frame)
         self.start_parts = len(self.vessel.parts.all)
+        
+        # --- FIX: TURN ON SAS AUTOPILOT ---
+        # This prevents the rocket from immediately tipping over at launch
+        self.vessel.auto_pilot.engage()
+        self.vessel.auto_pilot.target_pitch_and_heading(90, 90)
+        
         self.vessel.control.throttle = 0.0
         self.current_step = 0
         self.last_stage_time = time.time()
@@ -34,8 +40,7 @@ class KSPLiftoffEnv(gym.Env):
         alt = self.flight.surface_altitude
         vel = self.flight.vertical_speed
         try:
-            resources = self.vessel.resources_in_decouple_stage(self.vessel.control.current_stage - 1, cumulative=True)
-            fuel = resources.amount('LiquidFuel')
+            fuel = self.vessel.resources.amount('LiquidFuel')
         except:
             fuel = 0.0
         return np.array([alt, vel, fuel], dtype=np.float32)
@@ -60,18 +65,26 @@ class KSPLiftoffEnv(gym.Env):
         except Exception:
             return np.array([0.0, 0.0, 0.0], dtype=np.float32), -1000, True, False, {}
 
-        # REWARD MATH
+        # --- THE FIX: ANTI-HOVER REWARD LOGIC ---
+        
+        # 1. Base rewards (Climbing is good)
         reward = (alt / 10000) * 5.0
         alt_gained = alt - self.last_alt
-        reward += alt_gained * 2.0
+        
+        # Multiply alt_gained more aggressively so it craves speed
+        reward += alt_gained * 5.0 
         self.last_alt = alt
         
+        # 2. THE TIME PENALTY (Existential Angst)
+        # We punish the AI slightly for every step it stays alive without finishing the mission.
+        # This forces it to hurry up and reach 10km to stop the pain!
+        reward -= 1.0 
+            
         terminated = False
         
         # --- SAFETY AND CRASH LOGIC ---
         if alt >= 10000:
-            print("TARGET REACHED!")
-            reward += 2000 
+            reward += 5000  # Increased jackpot
             terminated = True
         elif current_parts < self.start_parts:
             reward -= 1000
@@ -90,31 +103,45 @@ class KSPLiftoffEnv(gym.Env):
         
         if alt > 30: self.has_launched = True
 
-        # STAGING LOGIC
+        # STAGING LOGIC (FUEL SANITY)
         if float(action[1]) > 0.8 and (time.time() - self.last_stage_time) > 2.0:
-            if fuel < 5.0: reward += 200 
-            else: reward -= 500
+            if fuel < 5.0: reward += 300 
+            else: reward -= 1000
+            
+        # Notice: Vertical Incentive and Thrust Bonus have been completely removed!
 
         return obs, reward, terminated, False, {}
 
+# --- THE MAIN LOOP (LOADING A SAVED BRAIN) ---
 if __name__ == "__main__":
     env = KSPLiftoffEnv()
     
-    # IMPLEMENTING DENSER NETWORK
-    # We increase the hidden layers to 128 neurons each to handle the complex state space
-    policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
+    # 1. LOAD THE SAVED MODEL INSTEAD OF CREATING A NEW ONE
+    print("Loading previously saved brain...")
     
-    model = PPO("MlpPolicy", env, 
-                policy_kwargs=policy_kwargs, 
-                verbose=1, 
-                device="cpu")
+    # Change the filename here if you want to load a specific checkpoint 
+    # e.g., "./saved_brains/liftoff_dense_10000_steps"
+    model = PPO.load("liftoff_dense_brain_final_v2", env=env, device="cpu")
     
+    # 2. Periodic Auto-Save (Continuing from where it left off)
     checkpoint_callback = CheckpointCallback(
         save_freq=5000, 
         save_path='./saved_brains/', 
-        name_prefix='liftoff_dense_model'
+        # You can change the prefix so you don't overwrite old checkpoints
+        name_prefix='liftoff_dense_continued' 
     )
     
-    print("Starting Training with Denser Brain...")
-    model.learn(total_timesteps=80000, callback=checkpoint_callback) 
-    model.save("liftoff_dense_brain_final")
+    print("Resuming Training! Press Ctrl+C to stop and save early.")
+    
+    # 3. The Early Interrupt Catch
+    try:
+        # You can adjust total_timesteps to however many MORE steps you want it to run
+        model.learn(total_timesteps=80000, callback=checkpoint_callback, reset_num_timesteps=False) 
+        
+        print("Training complete! Saving final model.")
+        model.save("liftoff_dense_brain_final_v3")
+        
+    except KeyboardInterrupt:
+        print("\n>>> Training Interrupted by User! Saving current brain state... <<<")
+        model.save("liftoff_dense_brain_interrupted")
+        print("Model saved safely as 'liftoff_dense_brain_interrupted'. Safe to close.")

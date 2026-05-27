@@ -6,9 +6,9 @@ logs/
 
 #data
 data/
+__pycache__/
 
-#models
-models/
 
 #results
 saved_brains
+*.zip
