@@ -18,11 +18,11 @@ vessel.auto_pilot.target_pitch_and_heading(90, 90)
 with open(filename, mode='w', newline='') as file:
     writer = csv.writer(file)
     writer.writerow([
-        'obs_alt', 'obs_vel', 'obs_fuel', 
+        'obs_alt', 'obs_vel', 'obs_fuel', 'obs_mass', # <-- 1. ADDED MASS TO HEADER
         'obs_pitch', 'obs_heading', 'obs_roll', 
         'obs_pos_x', 'obs_pos_y', 'obs_pos_z',
-        'obs_ap', 'obs_pe', 'obs_time_to_ap',  # <-- THE CRITICAL ADDITIONS
-        'act_throttle', 'act_stage'
+        'obs_ap', 'obs_pe', 'obs_time_to_ap', 
+        'act_throttle', 'act_pitch', 'act_stage' 
     ])
 
     print("\n>>> ROBOT TEACHER ARMED <<<")
@@ -44,11 +44,14 @@ with open(filename, mode='w', newline='') as file:
             alt = flight.surface_altitude
             vel = flight.vertical_speed
             ap = vessel.orbit.apoapsis_altitude
-            pe = vessel.orbit.periapsis_altitude         # Tracks the bottom of your orbit
-            time_to_ap = vessel.orbit.time_to_apoapsis   # Counts down to the highest point
+            pe = vessel.orbit.periapsis_altitude         
+            time_to_ap = vessel.orbit.time_to_apoapsis   
             
             try: fuel = vessel.resources.amount('LiquidFuel')
             except: fuel = 0.0
+            
+            # <-- 2. READ THE LIVE MASS FROM kRPC
+            mass = vessel.mass 
             
             pitch = surface_flight.pitch
             heading = surface_flight.heading
@@ -59,7 +62,7 @@ with open(filename, mode='w', newline='') as file:
             target_throttle = 0.0
             target_pitch = 90.0
             stage_action = 0.0
-            recording_paused = False # Default to recording data
+            recording_paused = False 
 
             # PHASE 0: Vertical Ascent (Clear the pad)
             if mission_phase == 0:
@@ -71,7 +74,6 @@ with open(filename, mode='w', newline='') as file:
             # PHASE 1: Smooth Gravity Turn
             elif mission_phase == 1:
                 fraction = (alt - 2000) / (45000 - 2000)
-                # Pitch smoothly from 90 down to 15 degrees
                 target_pitch = max(15.0, 90.0 - (fraction * 75.0))
                 target_throttle = 1.0
                 
@@ -82,7 +84,6 @@ with open(filename, mode='w', newline='') as file:
 
             # PHASE 2: Push Apoapsis to 100k
             elif mission_phase == 2:
-                # Keep nose slightly up (15 deg) to push Ap out of the atmosphere efficiently
                 target_pitch = 15.0 
                 target_throttle = 0.7
                 if ap >= 100000:
@@ -91,24 +92,21 @@ with open(filename, mode='w', newline='') as file:
 
             # PHASE 3: Coast to Apoapsis
             elif mission_phase == 3:
-                target_pitch = 0.0 # Lay perfectly horizontal (0 degrees) for the upcoming burn
+                target_pitch = 0.0 
                 target_throttle = 0.0
                 
-                # CRITICAL AI FIX: If we are coasting for minutes, pause recording.
                 if time_to_ap > 20.0:
                     recording_paused = True
 
-                # Start the circularization burn 15 seconds before reaching the exact Apoapsis
                 if time_to_ap <= 15.0 or time_to_ap > (vessel.orbit.period / 2):
                     print("\n>>> ORBITAL INSERTION BURN INITIATED <<<")
                     mission_phase = 4
 
             # PHASE 4: Orbital Insertion Burn
             elif mission_phase == 4:
-                target_pitch = 0.0 # Stay flat
+                target_pitch = 0.0 
                 target_throttle = 1.0
                 
-                # Stop burning when Periapsis clears the atmosphere (75km makes a safe loop)
                 if pe >= 80000:
                     mission_phase = 5
 
@@ -116,21 +114,18 @@ with open(filename, mode='w', newline='') as file:
             vessel.auto_pilot.target_pitch_and_heading(target_pitch, 90)
             vessel.control.throttle = target_throttle
 
-            # --- EXPERT STAGING LOGIC (Upgraded for Vessel Tracking) ---
+            # --- EXPERT STAGING LOGIC ---
             active_engines = [e for e in vessel.parts.engines if e.active]
             booster_flamed_out = any(e.available_thrust == 0 for e in active_engines)
             
             if (booster_flamed_out or vessel.available_thrust == 0) and target_throttle > 0 and (time.time() - last_stage_time) > 1.5:
-                # 1. Force the globally active vessel to stage (prevents the crash)
                 conn.space_center.active_vessel.control.activate_next_stage()
                 last_stage_time = time.time()
                 stage_action = 1.0
                 print(">>> AUTO-STAGING TRIGGERED <<<")
                 
-                # 2. Give KSP a fraction of a second to compute the physics split
                 time.sleep(0.5)
                 
-                # 3. RE-ACQUIRE THE ROCKET! (Prevents recording the falling debris)
                 vessel = conn.space_center.active_vessel
                 ref_frame = vessel.orbit.body.reference_frame
                 flight = vessel.flight(ref_frame)
@@ -140,11 +135,11 @@ with open(filename, mode='w', newline='') as file:
             # --- 3. RECORD DATA FOR THE AI ---
             if not recording_paused:
                 writer.writerow([
-                    alt, vel, fuel, 
+                    alt, vel, fuel, mass, # <-- 3. ADDED MASS TO THE DATA ARRAY
                     pitch, heading, roll, 
                     pos_x, pos_y, pos_z, 
-                    ap, pe, time_to_ap,         # <-- MATCHING DATA POINTS
-                    target_throttle, stage_action
+                    ap, pe, time_to_ap,         
+                    target_throttle, target_pitch / 90.0, stage_action 
                 ])
             
             # PHASE 5: End Script Successfully
@@ -154,7 +149,6 @@ with open(filename, mode='w', newline='') as file:
                 print(f"Flawless expert data saved to {filename}.")
                 break
 
-            # Run at 10Hz to match the AI environment
             time.sleep(0.1)
 
     except KeyboardInterrupt:
