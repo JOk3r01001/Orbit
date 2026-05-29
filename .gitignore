@@ -7,8 +7,10 @@ logs/
 #data
 data/
 __pycache__/
+ksp_tensorboard
 
 
 #results
 saved_brains
 *.zip
+
