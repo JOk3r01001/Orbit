@@ -9,7 +9,7 @@ ref_frame = vessel.orbit.body.reference_frame
 flight = vessel.flight(ref_frame)
 surface_flight = vessel.flight(vessel.surface_reference_frame)
 
-filename = "expert_automated_data.csv"
+filename = "flight.csv"
 
 # Ensure Autopilot is engaged before launch
 vessel.auto_pilot.engage()
@@ -20,7 +20,8 @@ with open(filename, mode='w', newline='') as file:
     writer.writerow([
         'obs_alt', 'obs_vel', 'obs_fuel', 
         'obs_pitch', 'obs_heading', 'obs_roll', 
-        'obs_pos_x', 'obs_pos_y', 'obs_pos_z', 
+        'obs_pos_x', 'obs_pos_y', 'obs_pos_z',
+        'obs_ap', 'obs_pe', 'obs_time_to_ap',  # <-- THE CRITICAL ADDITIONS
         'act_throttle', 'act_stage'
     ])
 
@@ -115,22 +116,34 @@ with open(filename, mode='w', newline='') as file:
             vessel.auto_pilot.target_pitch_and_heading(target_pitch, 90)
             vessel.control.throttle = target_throttle
 
-            # --- EXPERT STAGING LOGIC (Upgraded for Side Boosters) ---
+            # --- EXPERT STAGING LOGIC (Upgraded for Vessel Tracking) ---
             active_engines = [e for e in vessel.parts.engines if e.active]
             booster_flamed_out = any(e.available_thrust == 0 for e in active_engines)
             
             if (booster_flamed_out or vessel.available_thrust == 0) and target_throttle > 0 and (time.time() - last_stage_time) > 1.5:
-                vessel.control.activate_next_stage()
+                # 1. Force the globally active vessel to stage (prevents the crash)
+                conn.space_center.active_vessel.control.activate_next_stage()
                 last_stage_time = time.time()
                 stage_action = 1.0
                 print(">>> AUTO-STAGING TRIGGERED <<<")
+                
+                # 2. Give KSP a fraction of a second to compute the physics split
+                time.sleep(0.5)
+                
+                # 3. RE-ACQUIRE THE ROCKET! (Prevents recording the falling debris)
+                vessel = conn.space_center.active_vessel
+                ref_frame = vessel.orbit.body.reference_frame
+                flight = vessel.flight(ref_frame)
+                surface_flight = vessel.flight(vessel.surface_reference_frame)
 
+            
             # --- 3. RECORD DATA FOR THE AI ---
             if not recording_paused:
                 writer.writerow([
                     alt, vel, fuel, 
                     pitch, heading, roll, 
                     pos_x, pos_y, pos_z, 
+                    ap, pe, time_to_ap,         # <-- MATCHING DATA POINTS
                     target_throttle, stage_action
                 ])
             
