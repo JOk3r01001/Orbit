@@ -652,7 +652,7 @@ if __name__ == "__main__":
         model.learn(
             total_timesteps=500_000,
             callback=checkpoint_callback,
-            progress_bar=True,
+            
         )
 
         model.save(model_path)
