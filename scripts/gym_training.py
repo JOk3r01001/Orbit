@@ -19,7 +19,7 @@ class KSPOrbitalEnv(gym.Env):
                     converted to 0 to 90 degrees
 
     Observation:
-        Normalized flight/orbit state.
+        12 normalized flight/orbit values.
     """
 
     metadata = {"render_modes": []}
@@ -30,9 +30,6 @@ class KSPOrbitalEnv(gym.Env):
         print("Connecting to KSP for Reinforcement Learning...")
         self.conn = krpc.connect(name="PPO_Trainer")
 
-        # -----------------------------
-        # ACTION SPACE
-        # -----------------------------
         # [Throttle, Pitch Fraction]
         self.action_space = spaces.Box(
             low=np.array([0.0, 0.0], dtype=np.float32),
@@ -40,11 +37,7 @@ class KSPOrbitalEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # -----------------------------
-        # OBSERVATION SPACE
-        # -----------------------------
         # 12 normalized values:
-        #
         # 0  altitude_norm
         # 1  vertical_speed_norm
         # 2  horizontal_speed_norm
@@ -57,7 +50,6 @@ class KSPOrbitalEnv(gym.Env):
         # 9  heading_error_norm
         # 10 throttle
         # 11 current_stage_norm
-        #
         self.observation_space = spaces.Box(
             low=-10.0,
             high=10.0,
@@ -67,7 +59,7 @@ class KSPOrbitalEnv(gym.Env):
 
         # Episode config
         self.dt = 0.1
-        self.max_steps = 5000  # about 500 seconds
+        self.max_steps = 5000
 
         # Orbit target
         self.target_pe = 70_000.0
@@ -129,8 +121,27 @@ class KSPOrbitalEnv(gym.Env):
 
         # Start launch
         self.vessel.control.throttle = 1.0
-        time.sleep(0.2)
-        self.vessel.control.activate_next_stage()
+        time.sleep(0.5)
+
+        # Robust launch staging:
+        # Some rockets have clamps/decouplers before engine ignition.
+        # This tries a few times until the vessel actually has thrust.
+        for i in range(4):
+            self._rebind_vessel_objects()
+
+            if self.vessel.available_thrust > 0.1:
+                print("Launch engine thrust detected.")
+                break
+
+            print(f"Initial launch staging attempt {i + 1}...")
+            self.vessel.control.activate_next_stage()
+            self.last_stage_time = time.time()
+            time.sleep(1.0)
+
+        self._rebind_vessel_objects()
+        self.vessel.auto_pilot.engage()
+        self.vessel.auto_pilot.target_pitch_and_heading(90, 90)
+        self.vessel.control.throttle = 1.0
 
         obs = self._get_obs()
         return obs, {}
@@ -145,13 +156,11 @@ class KSPOrbitalEnv(gym.Env):
         terminated = False
         truncated = False
 
-        # Read current values before applying action
+        # Read values before applying action
         alt, vertical_speed, horizontal_speed = self._get_speed_values()
         ap = self._safe_apoapsis()
 
-        # -----------------------------
-        # APPLY ACTION
-        # -----------------------------
+        # Apply action
         raw_throttle = float(np.clip(action[0], 0.0, 1.0))
         raw_pitch_fraction = float(np.clip(action[1], 0.0, 1.0))
 
@@ -190,10 +199,6 @@ class KSPOrbitalEnv(gym.Env):
             time_to_ap=time_to_ap,
         )
 
-        # -----------------------------
-        # TERMINATION CONDITIONS
-        # -----------------------------
-
         # Success: stable orbit above atmosphere
         if pe > self.target_pe and ap > self.target_pe:
             circularity_error = abs(ap - pe)
@@ -212,9 +217,14 @@ class KSPOrbitalEnv(gym.Env):
             terminated = True
 
         # Failure: no launch
-        elif self.current_step > 150 and alt < 500:
+        elif self.current_step > 200 and alt < 500:
             reward -= 3000.0
-            print(f"[{self.current_step}] FAILURE: Did not launch properly.")
+            print(
+                f"[{self.current_step}] FAILURE: Did not launch properly | "
+                f"Alt: {alt:.1f} m | "
+                f"Thrust: {self.vessel.available_thrust:.1f} | "
+                f"Throttle: {throttle_cmd:.2f}"
+            )
             terminated = True
 
         # Failure: crash / flip near ground
@@ -224,7 +234,12 @@ class KSPOrbitalEnv(gym.Env):
             terminated = True
 
         # Failure: falling back into atmosphere after reaching high altitude
-        elif self.current_step > 300 and alt < self.prev_altitude - 500 and vertical_speed < -100 and ap < 50_000:
+        elif (
+            self.current_step > 300
+            and alt < self.prev_altitude - 500
+            and vertical_speed < -100
+            and ap < 50_000
+        ):
             reward -= 2500.0
             print(f"[{self.current_step}] FAILURE: Falling without useful trajectory.")
             terminated = True
@@ -253,6 +268,7 @@ class KSPOrbitalEnv(gym.Env):
             "vertical_speed": vertical_speed,
             "pitch": pitch,
             "throttle": throttle_cmd,
+            "available_thrust": self.vessel.available_thrust,
         }
 
         return obs, reward, terminated, truncated, info
@@ -330,71 +346,45 @@ class KSPOrbitalEnv(gym.Env):
         delta_pe = pe - self.prev_pe
         delta_horizontal_speed = horizontal_speed - self.prev_horizontal_speed
 
-        # --------------------------------------------------
         # 1. Liftoff and early ascent
-        # --------------------------------------------------
-
         if alt > 100:
             reward += 1.0
 
         if alt < 1000:
-            # Must point mostly upward near the ground
             if pitch > 75:
                 reward += 1.0
             else:
                 reward -= 3.0
 
-            # Encourage positive vertical speed at launch
             reward += 0.01 * np.clip(vertical_speed, -50, 100)
 
-        # --------------------------------------------------
         # 2. Apoapsis progress
-        # --------------------------------------------------
-
-        # Reward raising apoapsis, but clip to avoid huge spikes.
         reward += 0.003 * np.clip(delta_ap, -1000.0, 1000.0)
 
-        # --------------------------------------------------
         # 3. Horizontal speed progress
-        # --------------------------------------------------
-
-        # Orbit needs horizontal velocity.
         reward += 0.05 * np.clip(delta_horizontal_speed, -20.0, 20.0)
 
-        # Small absolute horizontal-speed reward after leaving lower atmosphere.
         if alt > 10_000:
             reward += 0.002 * horizontal_speed
 
-        # --------------------------------------------------
-        # 4. Gravity turn guidance
-        # --------------------------------------------------
-
+        # 4. Gravity turn shaping
         target_pitch = self._target_pitch_for_altitude(alt)
         pitch_error = abs(pitch - target_pitch)
 
-        # Do not force this too hard, but guide the model.
         if 1000 < alt < 70_000:
             reward -= 0.03 * pitch_error
 
-        # --------------------------------------------------
         # 5. Apoapsis zone rewards
-        # --------------------------------------------------
-
         if 70_000 < ap < 140_000:
             reward += 15.0
 
         if self.target_ap_low < ap < self.target_ap_high:
             reward += 30.0
 
-        # --------------------------------------------------
         # 6. Periapsis progress
-        # --------------------------------------------------
-
-        # Reward periapsis improvement only after apoapsis is near space.
         if ap > 60_000:
             reward += 0.002 * np.clip(delta_pe, -1000.0, 1000.0)
 
-        # Strong reward once periapsis gets closer to space.
         if pe > 0:
             reward += 100.0
 
@@ -404,42 +394,28 @@ class KSPOrbitalEnv(gym.Env):
         if pe > 50_000:
             reward += 700.0
 
-        # --------------------------------------------------
         # 7. Coast/circularization behavior
-        # --------------------------------------------------
-
-        # If apoapsis is already high, it is okay to reduce throttle before circularization.
         if ap > 80_000 and time_to_ap > 30 and throttle < 0.2:
             reward += 2.0
 
-        # Penalize burning too long after apoapsis is very high.
         if ap > 200_000 and throttle > 0.5:
             reward -= 20.0
 
-        # --------------------------------------------------
         # 8. Bad behavior penalties
-        # --------------------------------------------------
-
-        # Wasting time
         reward -= 0.1
 
-        # Sitting on the pad with low throttle
         if self.current_step > 30 and alt < 100 and throttle < 0.5:
             reward -= 10.0
 
-        # Going horizontal too early
         if alt < 3000 and pitch < 60:
             reward -= 10.0
 
-        # Straight up for too long
         if alt > 20_000 and pitch > 80 and horizontal_speed < 500:
             reward -= 5.0
 
-        # Falling
         if alt > 1000 and vertical_speed < -50:
             reward -= 10.0
 
-        # Apoapsis way too high without periapsis
         if ap > 250_000 and pe < 0:
             reward -= 50.0
 
@@ -450,11 +426,6 @@ class KSPOrbitalEnv(gym.Env):
     # --------------------------------------------------
 
     def _compute_safe_throttle(self, raw_throttle, alt, ap):
-        """
-        Keeps throttle safe during early ascent, but still allows throttle
-        control later for multi-stage ascent and circularization.
-        """
-
         # Mandatory liftoff power
         if alt < 1000:
             return 1.0
@@ -467,14 +438,9 @@ class KSPOrbitalEnv(gym.Env):
         return raw_throttle
 
     def _compute_safe_pitch(self, raw_pitch_fraction, alt):
-        """
-        Converts action to pitch while preventing obviously impossible
-        early-launch behavior.
-        """
-
         requested_pitch = raw_pitch_fraction * 90.0
 
-        # Early launch: do not allow immediate sideways pitch
+        # Early launch: prevent immediate sideways pitch
         if alt < 500:
             return max(80.0, requested_pitch)
 
@@ -484,11 +450,6 @@ class KSPOrbitalEnv(gym.Env):
         return requested_pitch
 
     def _target_pitch_for_altitude(self, alt):
-        """
-        Rough gravity-turn guide.
-        This is only used in reward shaping, not as direct control.
-        """
-
         if alt < 1000:
             return 90.0
         elif alt < 10_000:
@@ -508,8 +469,11 @@ class KSPOrbitalEnv(gym.Env):
         """
         Automated staging for multi-stage rockets.
 
-        This avoids the problem in the original baseline where ANY engine with
-        zero thrust could trigger staging too early.
+        Handles:
+        - no active engines
+        - dead active engines
+        - launch clamps / staging order problems
+        - vessel has no available thrust while throttle is commanded
         """
 
         now = time.time()
@@ -521,16 +485,32 @@ class KSPOrbitalEnv(gym.Env):
             return
 
         try:
-            active_engines = [engine for engine in self.vessel.parts.engines if engine.active]
+            active_engines = [
+                engine for engine in self.vessel.parts.engines
+                if engine.active
+            ]
+
+            vessel_no_thrust = self.vessel.available_thrust <= 0.1
+
+            # Important fix:
+            # If no engines are active and the vessel has no thrust,
+            # try staging again instead of returning forever.
+            if len(active_engines) == 0 and vessel_no_thrust:
+                print(f"[{self.current_step}] No active engines. Staging again...")
+                self.vessel.control.activate_next_stage()
+                self.last_stage_time = now
+                time.sleep(0.5)
+                self._rebind_vessel_objects()
+                self.vessel.auto_pilot.engage()
+                return
 
             if len(active_engines) == 0:
                 return
 
-            # Stage only if all active engines are producing basically no thrust.
-            all_engines_dead = all(engine.available_thrust <= 0.1 for engine in active_engines)
-
-            # Also stage if vessel available thrust is zero while throttle is commanded.
-            vessel_no_thrust = self.vessel.available_thrust <= 0.1
+            all_engines_dead = all(
+                engine.available_thrust <= 0.1
+                for engine in active_engines
+            )
 
             if all_engines_dead or vessel_no_thrust:
                 print(f"[{self.current_step}] Staging...")
@@ -539,7 +519,6 @@ class KSPOrbitalEnv(gym.Env):
 
                 time.sleep(0.5)
                 self._rebind_vessel_objects()
-
                 self.vessel.auto_pilot.engage()
 
         except Exception as e:
@@ -555,7 +534,9 @@ class KSPOrbitalEnv(gym.Env):
         self.ref_frame = self.body.reference_frame
 
         self.flight = self.vessel.flight(self.ref_frame)
-        self.surface_flight = self.vessel.flight(self.vessel.surface_reference_frame)
+        self.surface_flight = self.vessel.flight(
+            self.vessel.surface_reference_frame
+        )
 
     def _get_liquid_fuel(self):
         try:
@@ -566,14 +547,24 @@ class KSPOrbitalEnv(gym.Env):
     def _safe_apoapsis(self):
         try:
             ap = float(self.vessel.orbit.apoapsis_altitude)
-            return np.nan_to_num(ap, nan=0.0, posinf=500_000.0, neginf=-100_000.0)
+            return np.nan_to_num(
+                ap,
+                nan=0.0,
+                posinf=500_000.0,
+                neginf=-100_000.0,
+            )
         except Exception:
             return 0.0
 
     def _safe_periapsis(self):
         try:
             pe = float(self.vessel.orbit.periapsis_altitude)
-            return np.nan_to_num(pe, nan=-600_000.0, posinf=500_000.0, neginf=-600_000.0)
+            return np.nan_to_num(
+                pe,
+                nan=-600_000.0,
+                posinf=500_000.0,
+                neginf=-600_000.0,
+            )
         except Exception:
             return -600_000.0
 
@@ -598,9 +589,6 @@ class KSPOrbitalEnv(gym.Env):
 
     @staticmethod
     def _angle_error_degrees(angle, target):
-        """
-        Returns smallest signed difference between two headings.
-        """
         return (angle - target + 180.0) % 360.0 - 180.0
 
 
@@ -613,17 +601,22 @@ if __name__ == "__main__":
 
     print("Initializing PPO Reinforcement Learning...")
 
-    model_path = "./ppo_ksp_brain"
+    # Fresh v2 experiment paths
+    model_path = "./ppo_ksp_brain_v2"
+    checkpoint_dir = "./models_v2/"
+    tensorboard_dir = "./ksp_tensorboard_v2/"
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     if os.path.exists(model_path + ".zip"):
-        print("Loading existing PPO brain...")
+        print("Loading existing PPO v2 brain...")
         model = PPO.load(
             model_path,
             env=env,
             device="cpu",
         )
     else:
-        print("Creating new PPO brain...")
+        print("Creating new PPO v2 brain...")
 
         model = PPO(
             "MlpPolicy",
@@ -637,13 +630,13 @@ if __name__ == "__main__":
             gae_lambda=0.95,
             clip_range=0.2,
             ent_coef=0.01,
-            tensorboard_log="./ksp_tensorboard/",
+            tensorboard_log=tensorboard_dir,
         )
 
     checkpoint_callback = CheckpointCallback(
         save_freq=5000,
-        save_path="./models/",
-        name_prefix="ksp_ppo",
+        save_path=checkpoint_dir,
+        name_prefix="ksp_ppo_v2",
     )
 
     print(">>> COMMENCING RL TRAINING. Press Ctrl+C to save and exit. <<<")
@@ -652,13 +645,25 @@ if __name__ == "__main__":
         model.learn(
             total_timesteps=500_000,
             callback=checkpoint_callback,
-            
+            reset_num_timesteps=False,
         )
 
         model.save(model_path)
-        print("Training complete. Brain saved.")
+        print(f"Training complete. Brain saved to {model_path}.zip")
 
     except KeyboardInterrupt:
-        print("\nTraining interrupted. Saving current brain state...")
+        print("\nTraining interrupted.")
+
+        interrupt_path = model_path + "_interrupt"
+        latest_path = model_path + "_latest"
+
+        print(f"Saving interrupt model to {interrupt_path}.zip ...")
+        model.save(interrupt_path)
+
+        print(f"Saving latest model to {latest_path}.zip ...")
+        model.save(latest_path)
+
+        print(f"Also updating main model at {model_path}.zip ...")
         model.save(model_path)
-        print("Brain saved.")
+
+        print("Brain saved safely.")
