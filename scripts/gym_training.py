@@ -59,7 +59,10 @@ class KSPOrbitalEnv(gym.Env):
 
         # Episode config
         self.dt = 0.1
-        self.max_steps = 5000
+
+        # Increased from 5000 to 8000 so the agent has more time
+        # to coast to apoapsis and perform circularization.
+        self.max_steps = 8000
 
         # Orbit target
         self.target_pe = 70_000.0
@@ -159,13 +162,25 @@ class KSPOrbitalEnv(gym.Env):
         # Read values before applying action
         alt, vertical_speed, horizontal_speed = self._get_speed_values()
         ap = self._safe_apoapsis()
+        time_to_ap = self._safe_time_to_apoapsis()
 
         # Apply action
         raw_throttle = float(np.clip(action[0], 0.0, 1.0))
         raw_pitch_fraction = float(np.clip(action[1], 0.0, 1.0))
 
-        throttle_cmd = self._compute_safe_throttle(raw_throttle, alt, ap)
-        pitch_cmd = self._compute_safe_pitch(raw_pitch_fraction, alt)
+        throttle_cmd = self._compute_safe_throttle(
+            raw_throttle,
+            alt,
+            ap,
+            time_to_ap,
+        )
+
+        pitch_cmd = self._compute_safe_pitch(
+            raw_pitch_fraction,
+            alt,
+            ap,
+            time_to_ap,
+        )
 
         self.vessel.control.throttle = throttle_cmd
         self.vessel.auto_pilot.target_pitch_and_heading(pitch_cmd, 90)
@@ -346,7 +361,10 @@ class KSPOrbitalEnv(gym.Env):
         delta_pe = pe - self.prev_pe
         delta_horizontal_speed = horizontal_speed - self.prev_horizontal_speed
 
+        # --------------------------------------------------
         # 1. Liftoff and early ascent
+        # --------------------------------------------------
+
         if alt > 100:
             reward += 1.0
 
@@ -358,50 +376,116 @@ class KSPOrbitalEnv(gym.Env):
 
             reward += 0.01 * np.clip(vertical_speed, -50, 100)
 
+        # --------------------------------------------------
         # 2. Apoapsis progress
-        reward += 0.003 * np.clip(delta_ap, -1000.0, 1000.0)
+        # --------------------------------------------------
+        # Apoapsis matters during ascent, but once it is high enough,
+        # periapsis should become the main target.
+        if ap < 80_000:
+            reward += 0.003 * np.clip(delta_ap, -1000.0, 1000.0)
+        else:
+            reward += 0.0005 * np.clip(delta_ap, -1000.0, 1000.0)
 
+        # --------------------------------------------------
         # 3. Horizontal speed progress
+        # --------------------------------------------------
+
         reward += 0.05 * np.clip(delta_horizontal_speed, -20.0, 20.0)
 
         if alt > 10_000:
             reward += 0.002 * horizontal_speed
 
+        # --------------------------------------------------
         # 4. Gravity turn shaping
+        # --------------------------------------------------
+
         target_pitch = self._target_pitch_for_altitude(alt)
         pitch_error = abs(pitch - target_pitch)
 
         if 1000 < alt < 70_000:
             reward -= 0.03 * pitch_error
 
+        # --------------------------------------------------
         # 5. Apoapsis zone rewards
+        # --------------------------------------------------
+
         if 70_000 < ap < 140_000:
             reward += 15.0
 
         if self.target_ap_low < ap < self.target_ap_high:
             reward += 30.0
 
-        # 6. Periapsis progress
-        if ap > 60_000:
-            reward += 0.002 * np.clip(delta_pe, -1000.0, 1000.0)
+        # Penalize excessive apoapsis if periapsis is still poor.
+        if ap > 180_000 and pe < 50_000:
+            reward -= 30.0
+
+        if ap > 250_000 and pe < 0:
+            reward -= 80.0
+
+        # --------------------------------------------------
+        # 6. Periapsis progress: stronger circularization focus
+        # --------------------------------------------------
+
+        if ap > 70_000:
+            # Once apoapsis is above atmosphere, raising periapsis
+            # is the main objective.
+            reward += 0.01 * np.clip(delta_pe, -1000.0, 1000.0)
+
+        # Breadcrumbs toward orbit, including negative Pe improvement.
+        if pe > -300_000:
+            reward += 50.0
+
+        if pe > -100_000:
+            reward += 150.0
 
         if pe > 0:
-            reward += 100.0
+            reward += 400.0
 
         if pe > 30_000:
-            reward += 300.0
+            reward += 900.0
 
         if pe > 50_000:
-            reward += 700.0
+            reward += 1500.0
 
-        # 7. Coast/circularization behavior
-        if ap > 80_000 and time_to_ap > 30 and throttle < 0.2:
-            reward += 2.0
+        if pe > 65_000:
+            reward += 3000.0
 
-        if ap > 200_000 and throttle > 0.5:
+        # --------------------------------------------------
+        # 7. Near-apoapsis circularization behavior
+        # --------------------------------------------------
+
+        if ap > 75_000 and time_to_ap < 60:
+            # Near apoapsis, the correct behavior is almost-horizontal burn.
+            if pitch < 15:
+                reward += 20.0
+            else:
+                reward -= 0.5 * abs(pitch - 5.0)
+
+            # Horizontal speed is what raises periapsis.
+            reward += 0.005 * horizontal_speed
+
+            # Reward actual burn near apoapsis.
+            if throttle > 0.3:
+                reward += 10.0
+            else:
+                reward -= 5.0
+
+        # Coasting is good when Ap is high but apoapsis is still far away.
+        if ap > 80_000 and time_to_ap > 90 and throttle < 0.2:
+            reward += 5.0
+
+        # Penalize burning too hard while far from apoapsis.
+        if ap > 80_000 and time_to_ap > 120 and throttle > 0.5:
+            reward -= 10.0
+
+        # Penalize burning too long after apoapsis is very high.
+        if ap > 200_000 and throttle > 0.5 and pe < 70_000:
             reward -= 20.0
 
+        # --------------------------------------------------
         # 8. Bad behavior penalties
+        # --------------------------------------------------
+
         reward -= 0.1
 
         if self.current_step > 30 and alt < 100 and throttle < 0.5:
@@ -416,36 +500,50 @@ class KSPOrbitalEnv(gym.Env):
         if alt > 1000 and vertical_speed < -50:
             reward -= 10.0
 
-        if ap > 250_000 and pe < 0:
-            reward -= 50.0
-
         return float(reward)
 
     # --------------------------------------------------
     # CONTROL HELPERS
     # --------------------------------------------------
 
-    def _compute_safe_throttle(self, raw_throttle, alt, ap):
+    def _compute_safe_throttle(self, raw_throttle, alt, ap, time_to_ap=None):
         # Mandatory liftoff power
         if alt < 1000:
             return 1.0
 
-        # Main ascent: do not let PPO completely shut off too early
+        # Main ascent: do not let PPO completely shut off too early.
         if ap < 65_000:
             return max(0.65, raw_throttle)
 
-        # Near-space coast / circularization: full freedom
+        if time_to_ap is not None:
+            # Apoapsis is high, but we are still far from it:
+            # coast and avoid wasting fuel / raising Ap too much.
+            if ap > 75_000 and time_to_ap > 90:
+                return min(raw_throttle, 0.10)
+
+            # Approaching apoapsis:
+            # force a restart burn so the agent can raise periapsis.
+            if ap > 75_000 and time_to_ap < 60:
+                return max(0.35, raw_throttle)
+
         return raw_throttle
 
-    def _compute_safe_pitch(self, raw_pitch_fraction, alt):
+    def _compute_safe_pitch(self, raw_pitch_fraction, alt, ap=None, time_to_ap=None):
         requested_pitch = raw_pitch_fraction * 90.0
 
-        # Early launch: prevent immediate sideways pitch
+        # Early launch: prevent immediate sideways pitch.
         if alt < 500:
             return max(80.0, requested_pitch)
 
         if alt < 1500:
             return max(70.0, requested_pitch)
+
+        # Circularization helper:
+        # Once apoapsis is above atmosphere and we are near apoapsis,
+        # force/limit the burn to almost horizontal.
+        if ap is not None and time_to_ap is not None:
+            if ap > 75_000 and time_to_ap < 60:
+                return min(requested_pitch, 10.0)
 
         return requested_pitch
 
@@ -469,18 +567,19 @@ class KSPOrbitalEnv(gym.Env):
         """
         Automated staging for multi-stage rockets.
 
-        Handles:
-        - no active engines
-        - dead active engines
-        - launch clamps / staging order problems
-        - vessel has no available thrust while throttle is commanded
+        Supports:
+        - normal full-stage burnout
+        - side booster burnout while main engine is still running
+        - no active engines / launch clamp staging
         """
 
         now = time.time()
 
+        # Prevent double-staging too quickly
         if now - self.last_stage_time < 1.5:
             return
 
+        # Do not stage while throttle is basically off
         if throttle_cmd < 0.1:
             return
 
@@ -492,9 +591,8 @@ class KSPOrbitalEnv(gym.Env):
 
             vessel_no_thrust = self.vessel.available_thrust <= 0.1
 
-            # Important fix:
-            # If no engines are active and the vessel has no thrust,
-            # try staging again instead of returning forever.
+            # No active engines and no thrust:
+            # probably need another staging command.
             if len(active_engines) == 0 and vessel_no_thrust:
                 print(f"[{self.current_step}] No active engines. Staging again...")
                 self.vessel.control.activate_next_stage()
@@ -507,19 +605,50 @@ class KSPOrbitalEnv(gym.Env):
             if len(active_engines) == 0:
                 return
 
-            all_engines_dead = all(
-                engine.available_thrust <= 0.1
-                for engine in active_engines
-            )
+            alive_engines = [
+                engine for engine in active_engines
+                if engine.available_thrust > 0.1
+            ]
 
+            dead_engines = [
+                engine for engine in active_engines
+                if engine.available_thrust <= 0.1
+            ]
+
+            all_engines_dead = len(dead_engines) == len(active_engines)
+            partial_flameout = len(dead_engines) > 0 and len(alive_engines) > 0
+
+            alt = self.flight.surface_altitude
+
+            # Case 1: full stage burnout
             if all_engines_dead or vessel_no_thrust:
-                print(f"[{self.current_step}] Staging...")
+                print(
+                    f"[{self.current_step}] Full burnout/no thrust. "
+                    f"Active engines: {len(active_engines)}. Staging..."
+                )
+
                 self.vessel.control.activate_next_stage()
                 self.last_stage_time = now
-
                 time.sleep(0.5)
                 self._rebind_vessel_objects()
                 self.vessel.auto_pilot.engage()
+                return
+
+            # Case 2: side boosters burned out, main engine still alive
+            if partial_flameout and alt > 100:
+                print(
+                    f"[{self.current_step}] Partial flameout. "
+                    f"Dead engines: {len(dead_engines)}, "
+                    f"Alive engines: {len(alive_engines)}. "
+                    f"Staging side boosters..."
+                )
+
+                self.vessel.control.activate_next_stage()
+                self.last_stage_time = now
+                time.sleep(0.5)
+                self._rebind_vessel_objects()
+                self.vessel.auto_pilot.engage()
+                return
 
         except Exception as e:
             print(f"Staging check failed: {e}")
