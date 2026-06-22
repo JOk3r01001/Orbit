@@ -68,12 +68,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         # Allowed commander target ranges
         self.randomize_commands = randomize_commands
-
         self.minimum_target_ap = 80_000.0
         self.maximum_target_ap = 180_000.0
-
         self.minimum_target_pe = 70_000.0
-
         self.maximum_minimum_fuel_fraction = 0.15
 
         # Default commander instruction
@@ -82,9 +79,16 @@ class KSPCommandedOrbitalEnv(gym.Env):
         self.command_min_fuel_fraction = 0.10
         self.command_urgency = 0.50
 
-        # The pilot succeeds when it gets within these tolerances
+        # The pilot succeeds within these tolerances
         self.ap_tolerance = 10_000.0
         self.pe_tolerance = 10_000.0
+
+        # Stop episodes that have overshot beyond recovery
+        self.maximum_ap_overshoot = 40_000.0
+        self.maximum_pe_overshoot = 40_000.0
+
+        # Maximum throttle during the coast phase
+        self.coast_throttle_cap = 0.02
 
         # Safety-intervention penalty strengths
         self.throttle_intervention_penalty_scale = 2.0
@@ -140,7 +144,6 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # Reset episode counters
         self.current_step = 0
         self.last_stage_time = time.time()
-
         self._reset_reward_milestones()
 
         # Store initial resources
@@ -186,7 +189,6 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
             self.vessel.control.activate_next_stage()
             self.last_stage_time = time.time()
-
             time.sleep(1.0)
 
         self._rebind_vessel_objects()
@@ -342,7 +344,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 1.0,
             )
         )
-        
+
         # Pitch requested directly by PPO, before safety correction
         requested_pitch = raw_pitch_fraction * 90.0
 
@@ -421,6 +423,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
             throttle=throttle_cmd,
             time_to_ap=time_to_ap,
         )
+
         # PPO actions that need less safety correction are rewarded
         reward -= safety_intervention_penalty
 
@@ -432,6 +435,15 @@ class KSPCommandedOrbitalEnv(gym.Env):
             pe - self.command_target_pe
         )
 
+        # Signed values: positive means the target was exceeded
+        ap_overshoot = (
+            ap - self.command_target_ap
+        )
+
+        pe_overshoot = (
+            pe - self.command_target_pe
+        )
+
         orbit_within_tolerance = (
             ap_error <= self.ap_tolerance
             and pe_error <= self.pe_tolerance
@@ -439,7 +451,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         )
 
         # --------------------------------------------------
-        # Successful commanded orbit
+        # Successful commanded orbit or fuel-command failure
         # --------------------------------------------------
 
         if orbit_within_tolerance:
@@ -495,6 +507,31 @@ class KSPCommandedOrbitalEnv(gym.Env):
                     f"Actual fuel: "
                     f"{fuel_fraction:.2f}"
                 )
+
+            terminated = True
+
+        # --------------------------------------------------
+        # Failure: both orbital parameters overshot badly
+        # --------------------------------------------------
+
+        elif (
+            ap_overshoot > self.maximum_ap_overshoot
+            and pe_overshoot > self.maximum_pe_overshoot
+        ):
+            reward -= 2000.0
+
+            print(
+                f"[{self.current_step}] "
+                f"UNRECOVERABLE OVERSHOOT | "
+                f"Target Ap: "
+                f"{self.command_target_ap / 1000:.1f} km | "
+                f"Actual Ap: "
+                f"{ap / 1000:.1f} km | "
+                f"Target Pe: "
+                f"{self.command_target_pe / 1000:.1f} km | "
+                f"Actual Pe: "
+                f"{pe / 1000:.1f} km"
+            )
 
             terminated = True
 
@@ -1036,6 +1073,14 @@ class KSPCommandedOrbitalEnv(gym.Env):
         if alt < 1000:
             return 1.0
 
+        # Stop adding orbital energy when both targets are effectively reached
+        if (
+            ap >= self.command_target_ap
+            and pe
+            >= self.command_target_pe - self.pe_tolerance
+        ):
+            return 0.0
+
         # Keep burning until close to commanded apoapsis
         ascent_threshold = max(
             65_000.0,
@@ -1057,7 +1102,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
             ):
                 return min(
                     raw_throttle,
-                    0.10,
+                    self.coast_throttle_cap,
                 )
 
             # Burn near apoapsis while Pe is still too low
@@ -1482,7 +1527,7 @@ if __name__ == "__main__":
         "reinforcement learning..."
     )
 
-    # Separate v3 paths.
+    # Separate v3 paths
     model_path = (
         "./ppo_ksp_commanded_pilot_v3"
     )
