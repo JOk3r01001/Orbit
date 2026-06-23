@@ -6,7 +6,7 @@ from gymnasium import spaces
 import krpc
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 
 class KSPCommandedOrbitalEnv(gym.Env):
@@ -90,9 +90,16 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # Maximum throttle during the coast phase
         self.coast_throttle_cap = 0.02
 
-        # Safety-intervention penalty strengths
-        self.throttle_intervention_penalty_scale = 2.0
-        self.pitch_intervention_penalty_scale = 2.0
+        # Safety-intervention penalties are deliberately small so they
+        # guide PPO without dominating the mission reward.
+        self.throttle_intervention_penalty_scale = 0.10
+        self.pitch_intervention_penalty_scale = 0.10
+
+        # Curriculum boundaries. The callback updates training_timesteps.
+        self.training_timesteps = 0
+        self.curriculum_stage = 1
+        self.curriculum_stage_1_steps = 100_000
+        self.curriculum_stage_2_steps = 300_000
 
         # KSP runtime objects
         self.vessel = None
@@ -120,6 +127,60 @@ class KSPCommandedOrbitalEnv(gym.Env):
         self.pe_positive_awarded = False
         self.pe_50k_awarded = False
         self.pe_near_target_awarded = False
+
+    def set_training_timesteps(self, timesteps):
+        """Receive the current SB3 timestep count from the callback."""
+        self.training_timesteps = int(timesteps)
+
+        if self.training_timesteps < self.curriculum_stage_1_steps:
+            self.curriculum_stage = 1
+        elif self.training_timesteps < self.curriculum_stage_2_steps:
+            self.curriculum_stage = 2
+        else:
+            self.curriculum_stage = 3
+
+    def _maximum_feasible_fuel_requirement(self, target_ap, target_pe):
+        """
+        Heuristic feasibility envelope for the current rocket.
+
+        Harder and higher orbits are assigned a lower maximum remaining-fuel
+        requirement. This should later be tuned from successful flight data.
+        """
+        ap_difficulty = float(
+            np.clip(
+                (target_ap - self.minimum_target_ap)
+                / (self.maximum_target_ap - self.minimum_target_ap),
+                0.0,
+                1.0,
+            )
+        )
+
+        available_pe_range = max(
+            1.0,
+            target_ap - self.minimum_target_pe,
+        )
+
+        pe_difficulty = float(
+            np.clip(
+                (target_pe - self.minimum_target_pe)
+                / available_pe_range,
+                0.0,
+                1.0,
+            )
+        )
+
+        combined_difficulty = (
+            0.70 * ap_difficulty
+            + 0.30 * pe_difficulty
+        )
+
+        return float(
+            np.clip(
+                0.15 - 0.10 * combined_difficulty,
+                0.03,
+                self.maximum_minimum_fuel_fraction,
+            )
+        )
 
     # --------------------------------------------------
     # RESET AND COMMAND SELECTION
@@ -204,7 +265,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
     def _select_command(self, options):
         """
-        During training, random commands are generated.
+        During training, commands are sampled from a three-stage curriculum.
 
         During deployment, an external command can be supplied through:
 
@@ -239,7 +300,14 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 )
             )
 
-            self.command_min_fuel_fraction = float(
+            feasible_fuel_maximum = (
+                self._maximum_feasible_fuel_requirement(
+                    self.command_target_ap,
+                    self.command_target_pe,
+                )
+            )
+
+            requested_fuel = float(
                 np.clip(
                     options.get(
                         "min_fuel_fraction",
@@ -249,6 +317,18 @@ class KSPCommandedOrbitalEnv(gym.Env):
                     self.maximum_minimum_fuel_fraction,
                 )
             )
+
+            self.command_min_fuel_fraction = min(
+                requested_fuel,
+                feasible_fuel_maximum,
+            )
+
+            if requested_fuel > feasible_fuel_maximum:
+                print(
+                    "MISSION MANAGER | Requested fuel requirement "
+                    f"{requested_fuel:.2f} was reduced to the "
+                    f"feasible maximum {feasible_fuel_maximum:.2f}."
+                )
 
             self.command_urgency = float(
                 np.clip(
@@ -263,24 +343,66 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         # Random command used during PPO training
         elif self.randomize_commands:
+            if self.curriculum_stage == 1:
+                target_ap_minimum = 95_000.0
+                target_ap_maximum = 105_000.0
+                target_pe_minimum = 75_000.0
+                target_pe_maximum = 90_000.0
+                stage_fuel_cap = 0.05
+
+            elif self.curriculum_stage == 2:
+                target_ap_minimum = 85_000.0
+                target_ap_maximum = 130_000.0
+                target_pe_minimum = 70_000.0
+                target_pe_maximum = None
+                stage_fuel_cap = 0.10
+
+            else:
+                target_ap_minimum = self.minimum_target_ap
+                target_ap_maximum = self.maximum_target_ap
+                target_pe_minimum = self.minimum_target_pe
+                target_pe_maximum = None
+                stage_fuel_cap = (
+                    self.maximum_minimum_fuel_fraction
+                )
+
             self.command_target_ap = float(
                 self.np_random.uniform(
-                    self.minimum_target_ap,
-                    self.maximum_target_ap,
+                    target_ap_minimum,
+                    target_ap_maximum,
                 )
             )
 
+            maximum_pe = self.command_target_ap
+            if target_pe_maximum is not None:
+                maximum_pe = min(
+                    maximum_pe,
+                    target_pe_maximum,
+                )
+
             self.command_target_pe = float(
                 self.np_random.uniform(
-                    self.minimum_target_pe,
-                    self.command_target_ap,
+                    target_pe_minimum,
+                    maximum_pe,
                 )
+            )
+
+            feasible_fuel_maximum = (
+                self._maximum_feasible_fuel_requirement(
+                    self.command_target_ap,
+                    self.command_target_pe,
+                )
+            )
+
+            maximum_training_fuel = min(
+                stage_fuel_cap,
+                feasible_fuel_maximum,
             )
 
             self.command_min_fuel_fraction = float(
                 self.np_random.uniform(
                     0.0,
-                    self.maximum_minimum_fuel_fraction,
+                    maximum_training_fuel,
                 )
             )
 
@@ -293,6 +415,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         print(
             "MISSION COMMAND | "
+            f"Curriculum stage: {self.curriculum_stage} | "
             f"Target Ap: "
             f"{self.command_target_ap / 1000:.1f} km | "
             f"Target Pe: "
@@ -320,6 +443,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         terminated = False
         truncated = False
         success = False
+        termination_reason = "in_progress"
 
         # Read state before applying the next action
         alt, _, _ = self._get_speed_values()
@@ -455,9 +579,13 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # --------------------------------------------------
 
         if orbit_within_tolerance:
-            accuracy_bonus = 5000.0 / (
-                1.0
-                + (ap_error + pe_error) / 10_000.0
+            normalized_final_error = (
+                ap_error / self.ap_tolerance
+                + pe_error / self.pe_tolerance
+            )
+
+            accuracy_bonus = 50.0 / (
+                1.0 + normalized_final_error
             )
 
             # Orbit and fuel requirement were both satisfied
@@ -465,11 +593,11 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 fuel_fraction
                 >= self.command_min_fuel_fraction
             ):
-                reward += 15_000.0
+                reward += 250.0
                 reward += accuracy_bonus
-                reward += 2_000.0
 
                 success = True
+                termination_reason = "success"
 
                 print(
                     f"[{self.current_step}] "
@@ -495,8 +623,24 @@ class KSPCommandedOrbitalEnv(gym.Env):
                     - fuel_fraction
                 )
 
-                reward -= 3_000.0
-                reward -= 10_000.0 * fuel_shortfall
+                normalized_fuel_shortfall = (
+                    fuel_shortfall
+                    / max(
+                        self.command_min_fuel_fraction,
+                        0.01,
+                    )
+                )
+
+                reward -= 60.0
+                reward -= 40.0 * float(
+                    np.clip(
+                        normalized_fuel_shortfall,
+                        0.0,
+                        1.0,
+                    )
+                )
+
+                termination_reason = "fuel_requirement_missed"
 
                 print(
                     f"[{self.current_step}] "
@@ -518,7 +662,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
             ap_overshoot > self.maximum_ap_overshoot
             and pe_overshoot > self.maximum_pe_overshoot
         ):
-            reward -= 2000.0
+            reward -= 75.0
+            termination_reason = "unrecoverable_overshoot"
 
             print(
                 f"[{self.current_step}] "
@@ -540,7 +685,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # --------------------------------------------------
 
         elif self.current_step > 200 and alt < 500:
-            reward -= 3000.0
+            reward -= 75.0
+            termination_reason = "did_not_launch"
 
             print(
                 f"[{self.current_step}] "
@@ -563,7 +709,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
             and alt < 100
             and pitch < 45
         ):
-            reward -= 3000.0
+            reward -= 75.0
+            termination_reason = "crash_or_flip"
 
             print(
                 f"[{self.current_step}] "
@@ -582,7 +729,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
             and vertical_speed < -100
             and ap < 50_000
         ):
-            reward -= 2500.0
+            reward -= 60.0
+            termination_reason = "falling_without_trajectory"
 
             print(
                 f"[{self.current_step}] "
@@ -596,7 +744,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # --------------------------------------------------
 
         elif self.current_step >= self.max_steps:
-            reward -= 1500.0
+            reward -= 50.0
+            termination_reason = "timeout"
 
             print(
                 f"[{self.current_step}] "
@@ -627,6 +776,14 @@ class KSPCommandedOrbitalEnv(gym.Env):
             "periapsis": pe,
             "apoapsis_error": ap_error,
             "periapsis_error": pe_error,
+            "normalized_apoapsis_error": (
+                ap_error / self.ap_tolerance
+            ),
+            "normalized_periapsis_error": (
+                pe_error / self.pe_tolerance
+            ),
+            "termination_reason": termination_reason,
+            "curriculum_stage": self.curriculum_stage,
             "horizontal_speed": horizontal_speed,
             "vertical_speed": vertical_speed,
             "pitch": pitch,
@@ -779,281 +936,265 @@ class KSPCommandedOrbitalEnv(gym.Env):
         throttle,
         time_to_ap,
     ):
+        """
+        Command-normalized reward.
+
+        The main signal is improvement measured in tolerance units. This keeps
+        rewards comparable across low, high, circular, and elliptical target
+        orbits. Repeated shaping terms are deliberately small and bounded.
+        """
         reward = 0.0
 
-        # Current errors relative to the commander target
-        ap_error = abs(
-            ap - self.command_target_ap
+        # --------------------------------------------------
+        # 1. Command-normalized target progress
+        # --------------------------------------------------
+
+        ap_error_units = (
+            abs(ap - self.command_target_ap)
+            / self.ap_tolerance
         )
 
-        pe_error = abs(
-            pe - self.command_target_pe
+        pe_error_units = (
+            abs(pe - self.command_target_pe)
+            / self.pe_tolerance
         )
 
-        # Errors during previous environment step
-        previous_ap_error = abs(
-            self.prev_ap - self.command_target_ap
+        previous_ap_error_units = (
+            abs(self.prev_ap - self.command_target_ap)
+            / self.ap_tolerance
         )
 
-        previous_pe_error = abs(
-            self.prev_pe - self.command_target_pe
+        previous_pe_error_units = (
+            abs(self.prev_pe - self.command_target_pe)
+            / self.pe_tolerance
         )
 
-        # Positive if the rocket moved closer to the target
-        ap_error_improvement = (
-            previous_ap_error - ap_error
+        ap_progress = (
+            previous_ap_error_units
+            - ap_error_units
         )
 
-        pe_error_improvement = (
-            previous_pe_error - pe_error
+        pe_progress = (
+            previous_pe_error_units
+            - pe_error_units
         )
+
+        reward += 2.0 * float(
+            np.clip(
+                ap_progress,
+                -1.0,
+                1.0,
+            )
+        )
+
+        # Pe becomes meaningful only after a useful Ap exists.
+        if ap > 60_000.0:
+            reward += 3.0 * float(
+                np.clip(
+                    pe_progress,
+                    -1.0,
+                    1.0,
+                )
+            )
+
+        # --------------------------------------------------
+        # 2. Small bounded ascent guidance
+        # --------------------------------------------------
+
+        if alt < 1000.0:
+            if pitch > 75.0:
+                reward += 0.02
+            else:
+                reward -= 0.05
+
+            reward += 0.02 * float(
+                np.clip(
+                    vertical_speed / 100.0,
+                    -0.5,
+                    1.0,
+                )
+            )
+
+        elif alt < 70_000.0:
+            target_pitch = self._target_pitch_for_altitude(
+                alt
+            )
+
+            normalized_pitch_error = float(
+                np.clip(
+                    abs(pitch - target_pitch) / 45.0,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            reward -= 0.02 * normalized_pitch_error
+
+        # --------------------------------------------------
+        # 3. Small horizontal progress only when useful
+        # --------------------------------------------------
 
         delta_horizontal_speed = (
             horizontal_speed
             - self.prev_horizontal_speed
         )
 
-        # --------------------------------------------------
-        # 1. Liftoff and early ascent
-        # --------------------------------------------------
-
-        if alt > 100:
-            reward += 1.0
-
-        if alt < 1000:
-            if pitch > 75:
-                reward += 1.0
-            else:
-                reward -= 3.0
-
-            reward += 0.01 * np.clip(
-                vertical_speed,
-                -50.0,
-                100.0,
-            )
-
-        # --------------------------------------------------
-        # 2. Move toward commanded apoapsis
-        # --------------------------------------------------
-
-        reward += 0.004 * np.clip(
-            ap_error_improvement,
-            -1000.0,
-            1000.0,
-        )
-
-        # Bounded proximity reward
-        reward += 8.0 * np.exp(
-            -ap_error / 20_000.0
-        )
-
-        # Penalize significant apoapsis overshoot
         if (
-            ap
-            > self.command_target_ap + 20_000.0
+            ap >= self.command_target_ap - 20_000.0
+            and pe < self.command_target_pe
         ):
-            ap_overshoot = (
-                ap - self.command_target_ap
-            )
-
-            reward -= min(
-                50.0,
-                0.001 * ap_overshoot,
+            reward += 0.05 * float(
+                np.clip(
+                    delta_horizontal_speed / 10.0,
+                    -1.0,
+                    1.0,
+                )
             )
 
         # --------------------------------------------------
-        # 3. Horizontal-speed progress
+        # 4. Small bounded overshoot guidance
         # --------------------------------------------------
 
-        reward += 0.05 * np.clip(
-            delta_horizontal_speed,
-            -20.0,
-            20.0,
+        ap_overshoot_after_margin = max(
+            0.0,
+            ap - self.command_target_ap - 20_000.0,
         )
 
-        if alt > 10_000:
-            reward += (
-                0.001 * horizontal_speed
-            )
+        pe_overshoot_after_margin = max(
+            0.0,
+            pe - self.command_target_pe - 20_000.0,
+        )
 
-        # --------------------------------------------------
-        # 4. Gravity-turn shaping
-        # --------------------------------------------------
-
-        target_pitch = (
-            self._target_pitch_for_altitude(
-                alt
+        reward -= 0.10 * float(
+            np.clip(
+                ap_overshoot_after_margin / 20_000.0,
+                0.0,
+                1.0,
             )
         )
 
-        pitch_error = abs(
-            pitch - target_pitch
+        reward -= 0.10 * float(
+            np.clip(
+                pe_overshoot_after_margin / 20_000.0,
+                0.0,
+                1.0,
+            )
         )
 
-        if 1000 < alt < 70_000:
-            reward -= (
-                0.03 * pitch_error
-            )
-
         # --------------------------------------------------
-        # 5. One-time apoapsis milestones
+        # 5. One-time milestones with a modest common scale
         # --------------------------------------------------
 
         if (
             not self.ap_above_atmosphere_awarded
             and ap >= 70_000.0
         ):
-            reward += 300.0
+            reward += 10.0
             self.ap_above_atmosphere_awarded = True
 
         if (
             not self.ap_near_target_awarded
-            and ap_error <= 20_000.0
+            and ap_error_units <= 2.0
         ):
-            reward += 500.0
+            reward += 15.0
             self.ap_near_target_awarded = True
 
-        # --------------------------------------------------
-        # 6. Move periapsis toward commanded target
-        # --------------------------------------------------
-
-        if ap > 60_000.0:
-            reward += 0.01 * np.clip(
-                pe_error_improvement,
-                -1000.0,
-                1000.0,
-            )
-
-            reward += 12.0 * np.exp(
-                -pe_error / 20_000.0
-            )
-
-        # Penalize significant periapsis overshoot
-        if (
-            pe
-            > self.command_target_pe + 20_000.0
-        ):
-            pe_overshoot = (
-                pe - self.command_target_pe
-            )
-
-            reward -= min(
-                50.0,
-                0.001 * pe_overshoot,
-            )
-
-        # One-time periapsis milestones
         if (
             not self.pe_positive_awarded
             and pe > 0.0
         ):
-            reward += 300.0
+            reward += 10.0
             self.pe_positive_awarded = True
 
         if (
             not self.pe_50k_awarded
             and pe > 50_000.0
         ):
-            reward += 700.0
+            reward += 20.0
             self.pe_50k_awarded = True
 
         if (
             not self.pe_near_target_awarded
-            and pe_error <= 20_000.0
+            and pe_error_units <= 2.0
             and pe > 60_000.0
         ):
-            reward += 1200.0
+            reward += 30.0
             self.pe_near_target_awarded = True
 
         # --------------------------------------------------
-        # 7. Coast and circularization behavior
+        # 6. Small coast and circularization guidance
         # --------------------------------------------------
 
         ap_ready_for_coast = (
-            ap
-            >= self.command_target_ap - 10_000.0
+            ap >= self.command_target_ap - 10_000.0
         )
 
         ap_ready_for_burn = (
-            ap
-            >= self.command_target_ap - 20_000.0
+            ap >= self.command_target_ap - 20_000.0
         )
 
         pe_still_low = (
-            pe
-            < self.command_target_pe - 5_000.0
+            pe < self.command_target_pe - 5_000.0
         )
 
-        # Coast while far from apoapsis
         if (
             ap_ready_for_coast
             and time_to_ap > 90.0
         ):
-            if throttle < 0.2:
-                reward += 3.0
+            if throttle <= 0.05:
+                reward += 0.03
+            elif throttle > 0.20:
+                reward -= 0.05
 
-            elif throttle > 0.5:
-                reward -= 8.0
-
-        # Circularization burn near apoapsis
         if (
             ap_ready_for_burn
             and time_to_ap < 60.0
             and pe_still_low
         ):
             if pitch < 15.0:
-                reward += 8.0
+                reward += 0.05
             else:
-                reward -= (
-                    0.3
-                    * abs(pitch - 5.0)
+                reward -= 0.05 * float(
+                    np.clip(
+                        abs(pitch - 5.0) / 45.0,
+                        0.0,
+                        1.0,
+                    )
                 )
 
-            reward += (
-                0.002
-                * horizontal_speed
-            )
-
-            if throttle > 0.3:
-                reward += 5.0
+            if throttle > 0.30:
+                reward += 0.03
             else:
-                reward -= 3.0
+                reward -= 0.03
 
         # --------------------------------------------------
-        # 8. Urgency and bad-behavior penalties
+        # 7. Small time and bad-behavior penalties
         # --------------------------------------------------
 
-        # Higher urgency means a larger penalty for every step
         reward -= (
-            0.05
-            + 0.15 * self.command_urgency
+            0.002
+            + 0.008 * self.command_urgency
         )
 
         if (
             self.current_step > 30
-            and alt < 100
+            and alt < 100.0
             and throttle < 0.5
         ):
-            reward -= 10.0
+            reward -= 0.10
+
+        if alt < 3000.0 and pitch < 60.0:
+            reward -= 0.10
 
         if (
-            alt < 3000
-            and pitch < 60
+            alt > 20_000.0
+            and pitch > 80.0
+            and horizontal_speed < 500.0
         ):
-            reward -= 10.0
+            reward -= 0.05
 
-        if (
-            alt > 20_000
-            and pitch > 80
-            and horizontal_speed < 500
-        ):
-            reward -= 5.0
-
-        if (
-            alt > 1000
-            and vertical_speed < -50
-        ):
-            reward -= 10.0
+        if alt > 1000.0 and vertical_speed < -50.0:
+            reward -= 0.10
 
         return float(reward)
 
@@ -1513,6 +1654,145 @@ class KSPCommandedOrbitalEnv(gym.Env):
             pass
 
 
+class KSPTrainingCallback(BaseCallback):
+    """
+    Synchronizes the command curriculum with SB3 timesteps and records
+    custom mission diagnostics in TensorBoard.
+    """
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        self.training_env.env_method(
+            "set_training_timesteps",
+            int(self.num_timesteps),
+        )
+
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+
+        for index, info in enumerate(infos):
+            ap_error_units = float(
+                info.get(
+                    "normalized_apoapsis_error",
+                    0.0,
+                )
+            )
+
+            pe_error_units = float(
+                info.get(
+                    "normalized_periapsis_error",
+                    0.0,
+                )
+            )
+
+            safety_penalty = float(
+                info.get(
+                    "safety_intervention_penalty",
+                    0.0,
+                )
+            )
+
+            fuel_fraction = float(
+                info.get("fuel_fraction", 0.0)
+            )
+
+            minimum_fuel = float(
+                info.get(
+                    "command_min_fuel_fraction",
+                    0.0,
+                )
+            )
+
+            fuel_margin = (
+                fuel_fraction - minimum_fuel
+            )
+
+            curriculum_stage = float(
+                info.get("curriculum_stage", 1)
+            )
+
+            self.logger.record_mean(
+                "diagnostics/apoapsis_error_tolerance_units",
+                ap_error_units,
+            )
+
+            self.logger.record_mean(
+                "diagnostics/periapsis_error_tolerance_units",
+                pe_error_units,
+            )
+
+            self.logger.record_mean(
+                "diagnostics/safety_intervention_penalty",
+                safety_penalty,
+            )
+
+            self.logger.record_mean(
+                "diagnostics/fuel_margin",
+                fuel_margin,
+            )
+
+            self.logger.record(
+                "curriculum/stage",
+                curriculum_stage,
+            )
+
+            episode_finished = (
+                index < len(dones)
+                and bool(dones[index])
+            )
+
+            if episode_finished:
+                actual_ap = float(
+                    info.get("apoapsis", 0.0)
+                ) / 1000.0
+
+                actual_pe = float(
+                    info.get("periapsis", 0.0)
+                ) / 1000.0
+
+                target_ap = float(
+                    info.get("command_target_ap", 0.0)
+                ) / 1000.0
+
+                target_pe = float(
+                    info.get("command_target_pe", 0.0)
+                ) / 1000.0
+
+                reason = info.get(
+                    "termination_reason",
+                    "unknown",
+                )
+
+                print(
+                    "\nEPISODE SUMMARY | "
+                    f"Reason: {reason} | "
+                    f"Ap: {actual_ap:.1f}/{target_ap:.1f} km | "
+                    f"Ap error: {ap_error_units:.2f} tolerances | "
+                    f"Pe: {actual_pe:.1f}/{target_pe:.1f} km | "
+                    f"Pe error: {pe_error_units:.2f} tolerances | "
+                    f"Fuel margin: {fuel_margin:+.3f}"
+                )
+
+                self.logger.record(
+                    "diagnostics/final_apoapsis_error_tolerance_units",
+                    ap_error_units,
+                )
+
+                self.logger.record(
+                    "diagnostics/final_periapsis_error_tolerance_units",
+                    pe_error_units,
+                )
+
+                self.logger.record(
+                    "diagnostics/final_fuel_margin",
+                    fuel_margin,
+                )
+
+        return True
+
+
 # --------------------------------------------------
 # TRAINING SCRIPT
 # --------------------------------------------------
@@ -1527,17 +1807,17 @@ if __name__ == "__main__":
         "reinforcement learning..."
     )
 
-    # Separate v3 paths
+    # Separate v4 paths for the redesigned reward
     model_path = (
-        "./ppo_ksp_commanded_pilot_v3"
+        "./ppo_ksp_commanded_pilot_v4"
     )
 
     checkpoint_dir = (
-        "./models_v3/"
+        "./models_v4/"
     )
 
     tensorboard_dir = (
-        "./ksp_tensorboard_v3/"
+        "./ksp_tensorboard_v4/"
     )
 
     os.makedirs(
@@ -1550,13 +1830,15 @@ if __name__ == "__main__":
         exist_ok=True,
     )
 
-    # Continue existing v3 training if the model exists
-    if os.path.exists(
+    starting_fresh = not os.path.exists(
         model_path + ".zip"
-    ):
+    )
+
+    # Continue existing v4 training if the model exists
+    if not starting_fresh:
         print(
             "Loading existing commanded "
-            "PPO v3 brain..."
+            "PPO v4 brain..."
         )
 
         model = PPO.load(
@@ -1566,11 +1848,15 @@ if __name__ == "__main__":
             tensorboard_log=tensorboard_dir,
         )
 
-    # Otherwise create a new 16-observation model
+        env.set_training_timesteps(
+            model.num_timesteps
+        )
+
+    # Otherwise create a new fresh v4 16-observation model
     else:
         print(
             "Creating a fresh commanded "
-            "PPO v3 brain..."
+            "PPO v4 brain..."
         )
 
         model = PPO(
@@ -1591,8 +1877,10 @@ if __name__ == "__main__":
     checkpoint_callback = CheckpointCallback(
         save_freq=5000,
         save_path=checkpoint_dir,
-        name_prefix="ksp_commanded_v3",
+        name_prefix="ksp_commanded_v4",
     )
+
+    training_callback = KSPTrainingCallback()
 
     print(
         ">>> COMMENCING COMMANDED RL TRAINING. "
@@ -1604,8 +1892,11 @@ if __name__ == "__main__":
         # the previous fixed-target task.
         model.learn(
             total_timesteps=1_000_000,
-            callback=checkpoint_callback,
-            reset_num_timesteps=False,
+            callback=[
+                checkpoint_callback,
+                training_callback,
+            ],
+            reset_num_timesteps=starting_fresh,
         )
 
         model.save(model_path)
