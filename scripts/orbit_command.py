@@ -616,6 +616,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
                     f"{accuracy_bonus:.0f}"
                 )
 
+
+            
+
             # Orbit was reached, but the fuel command was missed
             else:
                 fuel_shortfall = (
@@ -657,6 +660,27 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # --------------------------------------------------
         # Failure: both orbital parameters overshot badly
         # --------------------------------------------------
+        elif (
+            ap_overshoot > 25_000.0
+            and pe
+            >= self.command_target_pe - self.pe_tolerance
+        ):
+            reward -= 60.0
+            termination_reason = "apoapsis_overshoot"
+            terminated = True
+
+            print(
+                f"[{self.current_step}] "
+                f"UNRECOVERABLE APOAPSIS OVERSHOOT | "
+                f"Target Ap: "
+                f"{self.command_target_ap / 1000:.1f} km | "
+                f"Actual Ap: "
+                f"{ap / 1000:.1f} km | "
+                f"Target Pe: "
+                f"{self.command_target_pe / 1000:.1f} km | "
+                f"Actual Pe: "
+                f"{pe / 1000:.1f} km"
+            )
 
         elif (
             ap_overshoot > self.maximum_ap_overshoot
