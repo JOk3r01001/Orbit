@@ -572,6 +572,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
             ap_error <= self.ap_tolerance
             and pe_error <= self.pe_tolerance
             and pe >= 70_000.0
+            and alt >= 70_000.0
         )
 
         # --------------------------------------------------
@@ -1005,23 +1006,50 @@ class KSPCommandedOrbitalEnv(gym.Env):
             - pe_error_units
         )
 
-        reward += 2.0 * float(
-            np.clip(
-                ap_progress,
-                -1.0,
-                1.0,
-            )
+        # First prioritize reaching the commanded apoapsis.
+        # Periapsis progress is rewarded only during the later
+        # circularization phase, so PPO cannot profit by turning
+        # horizontal too early in the atmosphere.
+        ap_ready = (
+            ap
+            >= self.command_target_ap - self.ap_tolerance
         )
 
-        # Pe becomes meaningful only after a useful Ap exists.
-        if ap > 60_000.0:
-            reward += 3.0 * float(
+        circularization_ready = (
+            alt >= 50_000.0
+            and ap
+            >= self.command_target_ap - 20_000.0
+            and 0.0 < time_to_ap <= 90.0
+        )
+
+        if not ap_ready:
+            reward += 2.5 * float(
                 np.clip(
-                    pe_progress,
+                    ap_progress,
                     -1.0,
                     1.0,
                 )
             )
+
+        else:
+            # Once Ap is ready, only a small Ap-progress signal remains.
+            # This still discourages drifting away from the command.
+            reward += 0.5 * float(
+                np.clip(
+                    ap_progress,
+                    -1.0,
+                    1.0,
+                )
+            )
+
+            if circularization_ready:
+                reward += 3.0 * float(
+                    np.clip(
+                        pe_progress,
+                        -1.0,
+                        1.0,
+                    )
+                )
 
         # --------------------------------------------------
         # 2. Small bounded ascent guidance
@@ -1054,7 +1082,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 )
             )
 
-            reward -= 0.02 * normalized_pitch_error
+            reward -= 0.10 * normalized_pitch_error
 
         # --------------------------------------------------
         # 3. Small horizontal progress only when useful
@@ -1066,7 +1094,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         )
 
         if (
-            ap >= self.command_target_ap - 20_000.0
+            circularization_ready
             and pe < self.command_target_pe
         ):
             reward += 0.05 * float(
@@ -1125,22 +1153,30 @@ class KSPCommandedOrbitalEnv(gym.Env):
             reward += 15.0
             self.ap_near_target_awarded = True
 
+        # Pe milestones count only if they are crossed during the
+        # circularization phase. Reaching them too early gives no payout.
         if (
-            not self.pe_positive_awarded
+            circularization_ready
+            and not self.pe_positive_awarded
+            and self.prev_pe <= 0.0
             and pe > 0.0
         ):
             reward += 10.0
             self.pe_positive_awarded = True
 
         if (
-            not self.pe_50k_awarded
+            circularization_ready
+            and not self.pe_50k_awarded
+            and self.prev_pe <= 50_000.0
             and pe > 50_000.0
         ):
             reward += 20.0
             self.pe_50k_awarded = True
 
         if (
-            not self.pe_near_target_awarded
+            circularization_ready
+            and not self.pe_near_target_awarded
+            and previous_pe_error_units > 2.0
             and pe_error_units <= 2.0
             and pe > 60_000.0
         ):
@@ -1173,8 +1209,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 reward -= 0.05
 
         if (
-            ap_ready_for_burn
-            and time_to_ap < 60.0
+            alt >= 50_000.0
+            and ap_ready_for_burn
+            and 0.0 < time_to_ap < 60.0
             and pe_still_low
         ):
             if pitch < 15.0:
@@ -1274,9 +1311,10 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
             # Burn near apoapsis while Pe is still too low
             if (
-                ap
+                alt >= 50_000.0
+                and ap
                 >= self.command_target_ap - 20_000.0
-                and time_to_ap < 60.0
+                and 0.0 < time_to_ap < 60.0
                 and pe
                 < self.command_target_pe - 5_000.0
             ):
@@ -1299,68 +1337,107 @@ class KSPCommandedOrbitalEnv(gym.Env):
             raw_pitch_fraction * 90.0
         )
 
-        # Prevent immediate sideways launch
-        if alt < 500:
-            return max(
-                80.0,
-                requested_pitch,
+        # Prevent an excessively early horizontal trajectory.
+        # KSP pitch: 90 degrees is vertical, 0 degrees is horizontal.
+        if alt < 500.0:
+            minimum_pitch = 80.0
+
+        elif alt < 1_500.0:
+            minimum_pitch = 70.0
+
+        elif alt < 10_000.0:
+            minimum_pitch = float(
+                np.interp(
+                    alt,
+                    [1_500.0, 10_000.0],
+                    [70.0, 65.0],
+                )
             )
 
-        if alt < 1500:
-            return max(
-                70.0,
-                requested_pitch,
+        elif alt < 40_000.0:
+            minimum_pitch = float(
+                np.interp(
+                    alt,
+                    [10_000.0, 40_000.0],
+                    [65.0, 45.0],
+                )
             )
 
-        # Keep circularization burn almost horizontal
+        elif alt < 50_000.0:
+            minimum_pitch = float(
+                np.interp(
+                    alt,
+                    [40_000.0, 50_000.0],
+                    [45.0, 15.0],
+                )
+            )
+
+        else:
+            minimum_pitch = 0.0
+
+        safe_pitch = max(
+            minimum_pitch,
+            requested_pitch,
+        )
+
+        # Allow an almost-horizontal burn only high enough,
+        # near the commanded apoapsis and close to apoapsis time.
         if (
-            ap is not None
+            alt >= 50_000.0
+            and ap is not None
             and pe is not None
             and time_to_ap is not None
+            and ap
+            >= self.command_target_ap - 20_000.0
+            and 0.0 < time_to_ap < 60.0
+            and pe
+            < self.command_target_pe - 5_000.0
         ):
-            if (
-                ap
-                >= self.command_target_ap - 20_000.0
-                and time_to_ap < 60.0
-                and pe
-                < self.command_target_pe - 5_000.0
-            ):
-                return min(
-                    requested_pitch,
-                    10.0,
-                )
+            return min(
+                safe_pitch,
+                10.0,
+            )
 
-        return requested_pitch
+        return safe_pitch
 
     @staticmethod
     def _target_pitch_for_altitude(alt):
-        if alt < 1000:
+        if alt < 1_000.0:
             return 90.0
 
-        if alt < 10_000:
+        if alt < 10_000.0:
             return float(
                 np.interp(
                     alt,
-                    [1000, 10_000],
+                    [1_000.0, 10_000.0],
                     [85.0, 65.0],
                 )
             )
 
-        if alt < 30_000:
+        if alt < 40_000.0:
             return float(
                 np.interp(
                     alt,
-                    [10_000, 30_000],
-                    [65.0, 30.0],
+                    [10_000.0, 40_000.0],
+                    [65.0, 45.0],
                 )
             )
 
-        if alt < 60_000:
+        if alt < 50_000.0:
             return float(
                 np.interp(
                     alt,
-                    [30_000, 60_000],
-                    [30.0, 5.0],
+                    [40_000.0, 50_000.0],
+                    [45.0, 15.0],
+                )
+            )
+
+        if alt < 60_000.0:
+            return float(
+                np.interp(
+                    alt,
+                    [50_000.0, 60_000.0],
+                    [15.0, 5.0],
                 )
             )
 
