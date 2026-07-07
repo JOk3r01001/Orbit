@@ -10,38 +10,38 @@ MODEL_PATH = "./ppo_ksp_commanded_pilot_v4_latest"
 
 EVAL_COMMANDS = [
     {
-        "target_ap": 90_000.0,
-        "target_pe": 75_000.0,
-        "min_fuel_fraction": 0.02,
-        "urgency": 0.5,
-    },
-    {
-        "target_ap": 100_000.0,
-        "target_pe": 80_000.0,
-        "min_fuel_fraction": 0.03,
-        "urgency": 0.5,
-    },
-    {
         "target_ap": 120_000.0,
         "target_pe": 90_000.0,
-        "min_fuel_fraction": 0.03,
+        "min_fuel_fraction": 0.02,
         "urgency": 0.5,
     },
     {
         "target_ap": 130_000.0,
         "target_pe": 100_000.0,
-        "min_fuel_fraction": 0.03,
+        "min_fuel_fraction": 0.02,
         "urgency": 0.5,
     },
     {
         "target_ap": 150_000.0,
+        "target_pe": 110_000.0,
+        "min_fuel_fraction": 0.015,
+        "urgency": 0.5,
+    },
+    {
+        "target_ap": 160_000.0,
         "target_pe": 120_000.0,
-        "min_fuel_fraction": 0.02,
+        "min_fuel_fraction": 0.015,
         "urgency": 0.5,
     },
     {
         "target_ap": 170_000.0,
         "target_pe": 130_000.0,
+        "min_fuel_fraction": 0.01,
+        "urgency": 0.5,
+    },
+    {
+        "target_ap": 180_000.0,
+        "target_pe": 140_000.0,
         "min_fuel_fraction": 0.01,
         "urgency": 0.5,
     },
