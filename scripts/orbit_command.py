@@ -1036,7 +1036,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 ap_deficit / self.ap_tolerance
             )
 
-            reward -= 0.05 * float(
+            reward -= 0.08 * float(
                 np.clip(
                     ap_deficit_units,
                     0.0,
@@ -1049,6 +1049,16 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 np.clip(
                     ap_progress,
                     -1.0,
+                    1.0,
+                )
+            )
+
+            # Extra reward for continuing to raise Ap
+            # when the commanded Ap has not been reached yet.
+            reward += 0.75 * float(
+                np.clip(
+                    ap_progress,
+                    0.0,
                     1.0,
                 )
             )
