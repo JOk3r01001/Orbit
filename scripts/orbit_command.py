@@ -1022,6 +1022,28 @@ class KSPCommandedOrbitalEnv(gym.Env):
             and 0.0 < time_to_ap <= 90.0
         )
 
+        # --------------------------------------------------
+        # Apoapsis undershoot pressure
+        # --------------------------------------------------
+
+        ap_deficit = self.command_target_ap - ap
+
+        if (
+            alt >= 20_000.0
+            and ap_deficit > self.ap_tolerance
+        ):
+            ap_deficit_units = (
+                ap_deficit / self.ap_tolerance
+            )
+
+            reward -= 0.05 * float(
+                np.clip(
+                    ap_deficit_units,
+                    0.0,
+                    5.0,
+                )
+            )
+        
         if not ap_ready:
             reward += 2.5 * float(
                 np.clip(
