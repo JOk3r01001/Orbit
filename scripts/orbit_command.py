@@ -64,7 +64,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         # Environment timing
         self.dt = 0.1
-        self.max_steps = 8000
+        self.max_steps = 9000
 
         # Allowed commander target ranges
         self.randomize_commands = randomize_commands
@@ -1320,7 +1320,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # Keep burning until close to commanded apoapsis
         ascent_threshold = max(
             65_000.0,
-            self.command_target_ap - 15_000.0,
+            self.command_target_ap - 7_000.0,
         )
 
         if ap < ascent_threshold:
