@@ -1,3 +1,27 @@
+"""
+apoapsis_specialist.py
+
+PPO specialist for one orbital task only:
+
+    Raise the vessel's apoapsis to a requested target.
+
+The model does NOT try to control periapsis as a goal. Periapsis is read only
+for safety, so the episode can stop if the orbit enters Kerbin's atmosphere.
+A separate future periapsis specialist should be trained for periapsis changes,
+and a high-level commander/LLM can switch between the two specialists.
+
+Control split:
+    PPO     -> throttle only
+    KSP SAS -> keeps the vessel pointing prograde
+
+Training save requirements:
+    - Named save: orbit_training_start
+    - Stable Kerbin orbit
+    - Vessel positioned shortly before periapsis
+    - Orbital engine attached and fuel available
+    - SAS/prograde mode available
+    - Throttle at zero when the save is created
+"""
 
 from __future__ import annotations
 
@@ -10,7 +34,7 @@ from gymnasium import spaces
 import krpc
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
 
@@ -19,17 +43,17 @@ from stable_baselines3.common.monitor import Monitor
 # SETTINGS — CHANGE THESE VALUES FIRST
 # =============================================================================
 
-# Choose: "check", "train", or "evaluate"
+# Choose: "check", "train", or "evaluate".
 RUN_MODE = "train"
 
-# Name of the KSP save loaded at the beginning of every episode.
+# Named KSP save loaded at the beginning of every episode.
 KSP_SAVE_NAME = "orbit_training_start"
 
-# Training output folders.
-OUTPUT_DIRECTORY = "orbit_correction_throttle_only_output"
+# Separate output location for the apoapsis-only specialist.
+OUTPUT_DIRECTORY = "apoapsis_specialist_output"
 CHECKPOINT_DIRECTORY = os.path.join(OUTPUT_DIRECTORY, "checkpoints")
 TENSORBOARD_DIRECTORY = os.path.join(OUTPUT_DIRECTORY, "tensorboard")
-FINAL_MODEL_PATH = os.path.join(OUTPUT_DIRECTORY, "orbit_correction_throttle_only_final")
+FINAL_MODEL_PATH = os.path.join(OUTPUT_DIRECTORY, "apoapsis_specialist_final")
 
 # Used only when RUN_MODE = "evaluate".
 MODEL_TO_EVALUATE = FINAL_MODEL_PATH + ".zip"
@@ -47,21 +71,36 @@ MAX_EPISODE_STEPS = 2500
 # Wait after loading a KSP save.
 SAVE_LOAD_WAIT = 3.0
 
-# Target apoapsis range for the first curriculum.
-TARGET_APOAPSIS_MIN = 90_000.0
+# Random apoapsis targets used by this first curriculum.
+TARGET_APOAPSIS_MIN = 110_000.0
 TARGET_APOAPSIS_MAX = 180_000.0
-
-# The target must be at least this far above the starting apoapsis.
 MINIMUM_APOAPSIS_INCREASE = 10_000.0
 
-# Success means both orbital values are within this tolerance.
-SUCCESS_TOLERANCE = 2_000.0
+# Episode succeeds when apoapsis is within this distance of the target.
+APOAPSIS_SUCCESS_TOLERANCE = 2_000.0
 
-# Kerbin atmosphere ends at 70 km.
+# Episode fails when apoapsis exceeds the target by more than this amount.
+MAX_APOAPSIS_OVERSHOOT = 5_000.0
+
+# Hard safety boundary only. Periapsis is not part of the learned goal/reward.
 MINIMUM_SAFE_PERIAPSIS = 70_000.0
 
-# Engines are blocked until the vessel is pointing close enough to prograde.
+# Engines remain blocked until SAS points sufficiently close to prograde.
 MINIMUM_ALIGNMENT = 0.97
+
+# Throttle is limited near the target to reduce overshooting.
+THROTTLE_TAPER_START = 20_000.0
+THROTTLE_FINE_START = 5_000.0
+MAX_THROTTLE_TAPER = 0.30
+MAX_THROTTLE_FINE = 0.10
+
+# Reward parameters.
+PROGRESS_REWARD_METERS = 1_000.0
+PROGRESS_REWARD_CLIP = 2.0
+FUEL_PENALTY_SCALE = 0.003
+TIME_PENALTY = 0.001
+SUCCESS_REWARD = 100.0
+FAILURE_PENALTY = 100.0
 
 # Resource names used to calculate fuel fraction.
 FUEL_RESOURCES = ("LiquidFuel", "Oxidizer")
@@ -74,40 +113,42 @@ SEED = 42
 # GYMNASIUM ENVIRONMENT
 # =============================================================================
 
-class OrbitCorrectionEnv(gym.Env):
+class ApoapsisSpecialistEnv(gym.Env):
     """
-    PPO environment for raising apoapsis from an existing orbit.
+    Goal-conditioned PPO environment for raising apoapsis only.
 
     Action:
-        action[0] = throttle command
-             0 -> zero throttle / coast
-             1 -> full throttle
+        action[0] = throttle command in [0, 1]
+                    0 -> coast
+                    1 -> full requested throttle
 
-        The action space intentionally has only one value. KSP SAS is kept
-        permanently in prograde mode for this first curriculum. PPO learns
-        when to burn and how much throttle to use.
+        KSP SAS remains in prograde mode. The environment may reduce or block
+        the requested throttle for alignment and overshoot safety.
 
-    Observation:
-        0  normalized current apoapsis
-        1  normalized current periapsis
-        2  normalized target apoapsis
-        3  normalized target periapsis
-        4  normalized apoapsis error
-        5  normalized periapsis error
-        6  time to apoapsis as fraction of orbital period
-        7  time to periapsis as fraction of orbital period
-        8  fuel fraction
-        9  normalized orbital speed
-        10 previous applied throttle
-        11 current mass fraction
-        12 prograde alignment
-        13 normalized acceleration capability (available thrust / mass)
+    Observations (12):
+        0   normalized current apoapsis
+        1   normalized current periapsis (safety/context only)
+        2   normalized target apoapsis
+        3   normalized signed apoapsis error
+        4   normalized time to apoapsis
+        5   normalized time to periapsis
+        6   fuel fraction
+        7   normalized orbital speed
+        8   previous applied throttle
+        9   current mass fraction
+        10  prograde alignment
+        11  normalized acceleration capability (available thrust / mass)
+
+    Periapsis is deliberately excluded from the goal, success condition, and
+    progress reward. It is retained only as a physical safety observation and
+    termination boundary. A separate future model should specialize in
+    periapsis changes.
     """
 
     def __init__(self) -> None:
         super().__init__()
 
-        # PPO controls throttle only. SAS handles prograde attitude.
+        # PPO controls one continuous value: throttle.
         self.action_space = spaces.Box(
             low=np.array([0.0], dtype=np.float32),
             high=np.array([1.0], dtype=np.float32),
@@ -117,12 +158,12 @@ class OrbitCorrectionEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(14,),
+            shape=(12,),
             dtype=np.float32,
         )
 
         print("Connecting to KSP through kRPC...")
-        self.connection = krpc.connect(name="PPO Orbit Correction")
+        self.connection = krpc.connect(name="PPO Apoapsis Specialist")
         self.space_center = self.connection.space_center
 
         self.vessel: Any = None
@@ -131,14 +172,15 @@ class OrbitCorrectionEnv(gym.Env):
         self.flight: Any = None
 
         self.target_apoapsis = 0.0
-        self.target_periapsis = 0.0
+        self.starting_periapsis = 0.0
 
         self.initial_fuel = 1.0
         self.initial_mass = 1.0
-        self.previous_total_error = 0.0
+        self.previous_absolute_apoapsis_error = 0.0
         self.previous_throttle = 0.0
         self.episode_steps = 0
 
+        # Observation normalization scales.
         self.altitude_scale = 250_000.0
         self.error_scale = 150_000.0
         self.speed_scale = 4_000.0
@@ -149,15 +191,19 @@ class OrbitCorrectionEnv(gym.Env):
     # -------------------------------------------------------------------------
 
     def _load_training_save(self) -> None:
-        """Load the same starting orbit at the beginning of every episode."""
+        """Load the same starting state at the beginning of every episode."""
 
         self.space_center.load(KSP_SAVE_NAME)
         time.sleep(SAVE_LOAD_WAIT)
 
+        # Loading a save invalidates old kRPC object references.
         self.vessel = self.space_center.active_vessel
         self.control = self.vessel.control
         self.orbit = self.vessel.orbit
 
+        self._activate_available_engines()
+
+        # Body-centered non-rotating frame gives meaningful orbital velocity.
         reference_frame = self.orbit.body.non_rotating_reference_frame
         self.flight = self.vessel.flight(reference_frame)
 
@@ -170,9 +216,47 @@ class OrbitCorrectionEnv(gym.Env):
         try:
             self.control.speed_mode = self.space_center.SpeedMode.orbit
         except Exception:
+            # This only changes the navball speed mode.
             pass
 
         self._set_prograde_sas()
+
+    def _activate_available_engines(self) -> None:
+        """Activate fueled engines so available_thrust is non-zero."""
+
+        engines = self.vessel.parts.engines
+
+        if not engines:
+            raise RuntimeError("No engines were found on the vessel.")
+
+        for engine in engines:
+            if engine.has_fuel and engine.max_thrust > 0.0:
+                try:
+                    engine.active = True
+                except Exception:
+                    pass
+
+        time.sleep(0.25)
+
+        if self.vessel.available_thrust <= 0.0:
+            raise RuntimeError(
+                "No usable engine could be activated. Check engine fuel, "
+                "staging, fuel flow, and engine status."
+            )
+
+    def _set_prograde_sas(self) -> None:
+        """Enable SAS and keep the vessel pointing prograde."""
+
+        self.control.sas = True
+        time.sleep(0.05)
+
+        try:
+            self.control.sas_mode = self.space_center.SASMode.prograde
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not enable prograde SAS. Ensure the vessel has SAS "
+                "capability and prograde mode is available."
+            ) from exc
 
     # -------------------------------------------------------------------------
     # TELEMETRY
@@ -180,13 +264,13 @@ class OrbitCorrectionEnv(gym.Env):
 
     @staticmethod
     def _safe_number(value: float, fallback: float = 0.0) -> float:
-        """Replace NaN or infinity with a safe finite value."""
+        """Replace NaN or infinity with a finite fallback."""
 
         value = float(value)
         return value if np.isfinite(value) else fallback
 
     def _fuel_amount(self) -> float:
-        """Return total LiquidFuel + Oxidizer currently on the vessel."""
+        """Return total configured propellant currently on the vessel."""
 
         total = 0.0
 
@@ -199,7 +283,7 @@ class OrbitCorrectionEnv(gym.Env):
         return total
 
     def _fuel_fraction(self) -> float:
-        """Return remaining fuel between 0 and 1."""
+        """Return remaining fuel as a value from 0 to 1."""
 
         if self.initial_fuel <= 0.0:
             return 0.0
@@ -222,7 +306,7 @@ class OrbitCorrectionEnv(gym.Env):
         first = np.asarray(first_vector, dtype=np.float64)
         second = np.asarray(second_vector, dtype=np.float64)
 
-        denominator = np.linalg.norm(first) * np.linalg.norm(second)
+        denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
 
         if denominator < 1e-10:
             return 0.0
@@ -231,7 +315,7 @@ class OrbitCorrectionEnv(gym.Env):
         return float(np.clip(result, -1.0, 1.0))
 
     def _get_prograde_alignment(self) -> float:
-        """Measure how closely the vessel is pointing prograde."""
+        """Measure how closely the vessel points prograde."""
 
         return self._alignment(
             self.flight.direction,
@@ -239,14 +323,18 @@ class OrbitCorrectionEnv(gym.Env):
         )
 
     def _telemetry(self) -> dict[str, float]:
-        """Read all KSP values needed by the environment."""
+        """Read all KSP values needed by this environment."""
 
         period = max(
             self._safe_number(self.orbit.period, fallback=1.0),
             1.0,
         )
 
-        mass = max(self._safe_number(self.vessel.mass, fallback=1.0), 1.0)
+        mass = max(
+            self._safe_number(self.vessel.mass, fallback=1.0),
+            1.0,
+        )
+
         available_thrust = max(
             self._safe_number(self.vessel.available_thrust),
             0.0,
@@ -276,10 +364,9 @@ class OrbitCorrectionEnv(gym.Env):
     # -------------------------------------------------------------------------
 
     def _choose_target(self, telemetry: dict[str, float]) -> None:
-        """Raise apoapsis while keeping periapsis near its starting value."""
+        """Choose a higher random apoapsis target for this episode."""
 
         starting_apoapsis = telemetry["apoapsis"]
-        starting_periapsis = telemetry["periapsis"]
 
         lowest_target = max(
             TARGET_APOAPSIS_MIN,
@@ -294,19 +381,11 @@ class OrbitCorrectionEnv(gym.Env):
         self.target_apoapsis = float(
             self.np_random.uniform(lowest_target, highest_target)
         )
-        self.target_periapsis = float(starting_periapsis)
 
-    def _errors(
-        self,
-        telemetry: dict[str, float],
-    ) -> tuple[float, float, float]:
-        """Return apoapsis error, periapsis error, and combined error."""
+    def _apoapsis_error(self, telemetry: dict[str, float]) -> float:
+        """Return signed target AP minus current AP, in meters."""
 
-        apoapsis_error = self.target_apoapsis - telemetry["apoapsis"]
-        periapsis_error = self.target_periapsis - telemetry["periapsis"]
-        total_error = abs(apoapsis_error) + abs(periapsis_error)
-
-        return apoapsis_error, periapsis_error, total_error
+        return self.target_apoapsis - telemetry["apoapsis"]
 
     def _observation(
         self,
@@ -314,7 +393,7 @@ class OrbitCorrectionEnv(gym.Env):
     ) -> np.ndarray:
         """Convert raw KSP values into the normalized PPO observation."""
 
-        apoapsis_error, periapsis_error, _ = self._errors(telemetry)
+        apoapsis_error = self._apoapsis_error(telemetry)
         period = telemetry["period"]
 
         time_to_apoapsis = np.clip(
@@ -322,6 +401,7 @@ class OrbitCorrectionEnv(gym.Env):
             0.0,
             1.0,
         )
+
         time_to_periapsis = np.clip(
             telemetry["time_to_periapsis"] / period,
             0.0,
@@ -339,20 +419,18 @@ class OrbitCorrectionEnv(gym.Env):
         observation = np.array(
             [
                 telemetry["apoapsis"] / self.altitude_scale,       # 0
-                telemetry["periapsis"] / self.altitude_scale,     # 1
+                telemetry["periapsis"] / self.altitude_scale,     # 1 safety
                 self.target_apoapsis / self.altitude_scale,        # 2
-                self.target_periapsis / self.altitude_scale,       # 3
-                apoapsis_error / self.error_scale,                 # 4
-                periapsis_error / self.error_scale,               # 5
-                time_to_apoapsis,                                 # 6
-                time_to_periapsis,                                # 7
-                telemetry["fuel_fraction"],                       # 8
-                telemetry["speed"] / self.speed_scale,            # 9
-                self.previous_throttle,                            # 10
-                mass_fraction,                                    # 11
-                prograde_alignment,                               # 12
+                apoapsis_error / self.error_scale,                 # 3
+                time_to_apoapsis,                                 # 4
+                time_to_periapsis,                                # 5
+                telemetry["fuel_fraction"],                       # 6
+                telemetry["speed"] / self.speed_scale,            # 7
+                self.previous_throttle,                            # 8
+                mass_fraction,                                    # 9
+                prograde_alignment,                               # 10
                 telemetry["acceleration_capability"]
-                / self.acceleration_scale,                        # 13
+                / self.acceleration_scale,                        # 11
             ],
             dtype=np.float32,
         )
@@ -367,28 +445,14 @@ class OrbitCorrectionEnv(gym.Env):
         return np.clip(observation, -1.0, 1.0).astype(np.float32)
 
     # -------------------------------------------------------------------------
-    # ACTIONS
+    # ACTION AND SAFETY GUARDS
     # -------------------------------------------------------------------------
-
-    def _set_prograde_sas(self) -> None:
-        """Enable SAS and keep the vessel pointing prograde."""
-
-        self.control.sas = True
-        time.sleep(0.05)
-
-        try:
-            self.control.sas_mode = self.space_center.SASMode.prograde
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not enable prograde SAS. Ensure the vessel has "
-                "SAS capability and the prograde mode is available."
-            ) from exc
 
     def _apply_action(
         self,
         action: np.ndarray,
     ) -> dict[str, float | str | bool]:
-        """Convert PPO's single output into a safe throttle command."""
+        """Convert PPO's throttle output into a guarded KSP command."""
 
         action = np.asarray(action, dtype=np.float32)
 
@@ -398,15 +462,44 @@ class OrbitCorrectionEnv(gym.Env):
             )
 
         action = np.clip(action, 0.0, 1.0)
-
-        # The PPO action already uses KSP's 0..1 throttle range.
         requested_throttle = float(action[0])
+
+        current_apoapsis = self._safe_number(
+            self.orbit.apoapsis_altitude
+        )
+        remaining_apoapsis = self.target_apoapsis - current_apoapsis
 
         prograde_alignment = self._get_prograde_alignment()
         aligned = prograde_alignment >= MINIMUM_ALIGNMENT
 
-        # Safety guard: never burn while SAS is still rotating to prograde.
-        applied_throttle = requested_throttle if aligned else 0.0
+        # Hard cutoff: once target AP is reached, never continue burning.
+        if remaining_apoapsis <= 0.0:
+            applied_throttle = 0.0
+            throttle_cap = 0.0
+            throttle_guard = "target_reached"
+
+        # Alignment guard: never burn while SAS is rotating to prograde.
+        elif not aligned:
+            applied_throttle = 0.0
+            throttle_cap = 0.0
+            throttle_guard = "waiting_for_alignment"
+
+        # Fine-control zone immediately before the target.
+        elif remaining_apoapsis <= THROTTLE_FINE_START:
+            throttle_cap = MAX_THROTTLE_FINE
+            applied_throttle = min(requested_throttle, throttle_cap)
+            throttle_guard = "fine_taper"
+
+        # Wider approach zone before the target.
+        elif remaining_apoapsis <= THROTTLE_TAPER_START:
+            throttle_cap = MAX_THROTTLE_TAPER
+            applied_throttle = min(requested_throttle, throttle_cap)
+            throttle_guard = "approach_taper"
+
+        else:
+            throttle_cap = 1.0
+            applied_throttle = requested_throttle
+            throttle_guard = "none"
 
         self.control.throttle = applied_throttle
         self.previous_throttle = applied_throttle
@@ -417,10 +510,13 @@ class OrbitCorrectionEnv(gym.Env):
             "aligned": aligned,
             "requested_throttle": requested_throttle,
             "applied_throttle": applied_throttle,
+            "throttle_cap": throttle_cap,
+            "throttle_guard": throttle_guard,
+            "remaining_apoapsis": remaining_apoapsis,
         }
 
     # -------------------------------------------------------------------------
-    # REWARD
+    # APOAPSIS-ONLY REWARD
     # -------------------------------------------------------------------------
 
     def _reward(
@@ -428,47 +524,85 @@ class OrbitCorrectionEnv(gym.Env):
         telemetry: dict[str, float],
         action_info: dict[str, float | str | bool],
     ) -> tuple[float, bool, bool, dict[str, Any]]:
-        """Reward reductions in orbital error and penalize waste/failure."""
+        """
+        Reward only progress toward target apoapsis.
 
-        apoapsis_error, periapsis_error, total_error = self._errors(telemetry)
-        improvement = self.previous_total_error - total_error
+        Periapsis does not affect progress, success, or precision reward. It is
+        checked only as a hard physical safety condition.
+        """
+
+        apoapsis_error = self._apoapsis_error(telemetry)
+        absolute_apoapsis_error = abs(apoapsis_error)
+
+        improvement = (
+            self.previous_absolute_apoapsis_error
+            - absolute_apoapsis_error
+        )
 
         progress_reward = float(
-            np.clip(improvement / 1_000.0, -5.0, 5.0)
+            np.clip(
+                improvement / PROGRESS_REWARD_METERS,
+                -PROGRESS_REWARD_CLIP,
+                PROGRESS_REWARD_CLIP,
+            )
         )
 
         applied_throttle = float(action_info["applied_throttle"])
-        fuel_penalty = applied_throttle * 0.003
-        time_penalty = 0.001
+        fuel_penalty = applied_throttle * FUEL_PENALTY_SCALE
+        time_penalty = TIME_PENALTY
 
-        success = (
-            abs(apoapsis_error) <= SUCCESS_TOLERANCE
-            and abs(periapsis_error) <= SUCCESS_TOLERANCE
+        # Success depends only on apoapsis precision.
+        success = absolute_apoapsis_error <= APOAPSIS_SUCCESS_TOLERANCE
+
+        # Apoapsis-specific failure guard.
+        apoapsis_overshoot = (
+            telemetry["apoapsis"]
+            > self.target_apoapsis + MAX_APOAPSIS_OVERSHOOT
         )
 
-        unsafe_orbit = telemetry["periapsis"] < MINIMUM_SAFE_PERIAPSIS
-        out_of_fuel = telemetry["fuel_fraction"] <= 0.001 and not success
-        no_thrust = telemetry["available_thrust"] <= 0.0 and not success
-        failure = unsafe_orbit or out_of_fuel or no_thrust
+        # Periapsis remains safety-only, not a learned target.
+        unsafe_periapsis = (
+            telemetry["periapsis"] < MINIMUM_SAFE_PERIAPSIS
+        )
+
+        out_of_fuel = (
+            telemetry["fuel_fraction"] <= 0.001
+            and not success
+        )
+
+        no_thrust = (
+            telemetry["available_thrust"] <= 0.0
+            and not success
+        )
+
+        failure = (
+            apoapsis_overshoot
+            or unsafe_periapsis
+            or out_of_fuel
+            or no_thrust
+        )
 
         reward = progress_reward - fuel_penalty - time_penalty
 
         if success:
-            reward += 100.0
-        if failure:
-            reward -= 100.0
+            reward += SUCCESS_REWARD
+        elif failure:
+            reward -= FAILURE_PENALTY
 
-        self.previous_total_error = total_error
+        self.previous_absolute_apoapsis_error = absolute_apoapsis_error
 
         info = {
             "success": success,
-            "unsafe_orbit": unsafe_orbit,
+            "is_success": int(success),
+            "apoapsis_overshoot": apoapsis_overshoot,
+            "unsafe_periapsis": unsafe_periapsis,
             "out_of_fuel": out_of_fuel,
             "no_thrust": no_thrust,
             "apoapsis_error": apoapsis_error,
-            "periapsis_error": periapsis_error,
-            "total_error": total_error,
+            "absolute_apoapsis_error": absolute_apoapsis_error,
             "progress_reward": progress_reward,
+            "fuel_penalty": fuel_penalty,
+            "time_penalty": time_penalty,
             "fuel_fraction": telemetry["fuel_fraction"],
         }
 
@@ -484,7 +618,7 @@ class OrbitCorrectionEnv(gym.Env):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        """Start a new episode from the saved orbit."""
+        """Start a new episode from the named orbital save."""
 
         super().reset(seed=seed)
         self._load_training_save()
@@ -510,27 +644,30 @@ class OrbitCorrectionEnv(gym.Env):
 
         if telemetry["available_thrust"] <= 0.0:
             raise RuntimeError(
-                "The vessel has no available thrust. Activate the orbital "
-                "engine before creating the training save."
+                "The vessel has no available thrust after engine activation."
             )
 
+        self.starting_periapsis = telemetry["periapsis"]
         self._choose_target(telemetry)
-        _, _, self.previous_total_error = self._errors(telemetry)
+
+        self.previous_absolute_apoapsis_error = abs(
+            self._apoapsis_error(telemetry)
+        )
+
         observation = self._observation(telemetry)
 
         info = {
             "starting_apoapsis": telemetry["apoapsis"],
             "starting_periapsis": telemetry["periapsis"],
             "target_apoapsis": self.target_apoapsis,
-            "target_periapsis": self.target_periapsis,
         }
 
         print(
-            "\nNew episode:"
-            f"\n  Start:  {telemetry['periapsis'] / 1000:.1f} x "
-            f"{telemetry['apoapsis'] / 1000:.1f} km"
-            f"\n  Target: {self.target_periapsis / 1000:.1f} x "
-            f"{self.target_apoapsis / 1000:.1f} km"
+            "\nNew apoapsis-specialist episode:"
+            f"\n  Start PE:  {telemetry['periapsis'] / 1000:.1f} km"
+            f"\n  Start AP:  {telemetry['apoapsis'] / 1000:.1f} km"
+            f"\n  Target AP: {self.target_apoapsis / 1000:.1f} km"
+            "\n  PE role: safety only"
         )
 
         return observation, info
@@ -548,6 +685,7 @@ class OrbitCorrectionEnv(gym.Env):
 
         telemetry = self._telemetry()
         observation = self._observation(telemetry)
+
         reward, success, failure, reward_info = self._reward(
             telemetry,
             action_info,
@@ -559,13 +697,30 @@ class OrbitCorrectionEnv(gym.Env):
         if terminated or truncated:
             self.control.throttle = 0.0
 
+            print(
+                "\nEpisode ended:"
+                f"\n  Success: {success}"
+                f"\n  Overshoot: {reward_info['apoapsis_overshoot']}"
+                f"\n  Unsafe PE: {reward_info['unsafe_periapsis']}"
+                f"\n  Out of fuel: {reward_info['out_of_fuel']}"
+                f"\n  No thrust: {reward_info['no_thrust']}"
+                f"\n  Timed out: {truncated}"
+                f"\n  Final AP: {telemetry['apoapsis'] / 1000:.1f} km"
+                f"\n  Target AP: {self.target_apoapsis / 1000:.1f} km"
+                f"\n  AP error: "
+                f"{reward_info['absolute_apoapsis_error']:.0f} m"
+                f"\n  Final PE: {telemetry['periapsis'] / 1000:.1f} km"
+            )
+
         info = {
             **action_info,
             **reward_info,
             "current_apoapsis": telemetry["apoapsis"],
             "current_periapsis": telemetry["periapsis"],
             "target_apoapsis": self.target_apoapsis,
-            "target_periapsis": self.target_periapsis,
+            "final_apoapsis_error": reward_info[
+                "absolute_apoapsis_error"
+            ],
             "episode_steps": self.episode_steps,
         }
 
@@ -593,28 +748,89 @@ class OrbitCorrectionEnv(gym.Env):
 
 
 # =============================================================================
+# TENSORBOARD METRICS
+# =============================================================================
+
+class ApoapsisMetricsCallback(BaseCallback):
+    """Write apoapsis-specialist metrics into the SB3 logger."""
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+
+        for info in infos:
+            if "absolute_apoapsis_error" not in info:
+                continue
+
+            self.logger.record(
+                "apoapsis/error_m",
+                float(info["absolute_apoapsis_error"]),
+            )
+            self.logger.record(
+                "apoapsis/current_m",
+                float(info["current_apoapsis"]),
+            )
+            self.logger.record(
+                "apoapsis/target_m",
+                float(info["target_apoapsis"]),
+            )
+            self.logger.record(
+                "apoapsis/applied_throttle",
+                float(info["applied_throttle"]),
+            )
+            self.logger.record(
+                "apoapsis/alignment",
+                float(info["alignment"]),
+            )
+            self.logger.record(
+                "apoapsis/fuel_fraction",
+                float(info["fuel_fraction"]),
+            )
+
+            if bool(info.get("success", False)):
+                self.logger.record("apoapsis/success_event", 1.0)
+
+            if bool(info.get("apoapsis_overshoot", False)):
+                self.logger.record("apoapsis/overshoot_event", 1.0)
+
+        return True
+
+
+# =============================================================================
 # TRAINING
 # =============================================================================
 
 def train_agent() -> None:
-    """Create a new PPO model and train it."""
+    """Create a new apoapsis-specialist PPO model and train it."""
 
     os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
     os.makedirs(CHECKPOINT_DIRECTORY, exist_ok=True)
     os.makedirs(TENSORBOARD_DIRECTORY, exist_ok=True)
 
-    env = Monitor(OrbitCorrectionEnv())
+    raw_env = ApoapsisSpecialistEnv()
+
+    env = Monitor(
+        raw_env,
+        info_keywords=(
+            "is_success",
+            "final_apoapsis_error",
+            "fuel_fraction",
+            "apoapsis_overshoot",
+        ),
+    )
 
     checkpoint_callback = CheckpointCallback(
         save_freq=25_000,
         save_path=CHECKPOINT_DIRECTORY,
-        name_prefix="orbit_correction_throttle_only",
+        name_prefix="apoapsis_specialist",
     )
+
+    metrics_callback = ApoapsisMetricsCallback()
 
     model = PPO(
         policy="MlpPolicy",
         env=env,
         learning_rate=1e-4,
+        device="cpu",
         n_steps=1024,
         batch_size=256,
         n_epochs=10,
@@ -638,10 +854,15 @@ def train_agent() -> None:
     try:
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS,
-            callback=checkpoint_callback,
+            callback=[checkpoint_callback, metrics_callback],
         )
+
         model.save(FINAL_MODEL_PATH)
-        print(f"\nTraining finished. Model saved to: {FINAL_MODEL_PATH}.zip")
+
+        print(
+            f"\nTraining finished. Model saved to: "
+            f"{FINAL_MODEL_PATH}.zip"
+        )
     finally:
         env.close()
 
@@ -651,13 +872,14 @@ def train_agent() -> None:
 # =============================================================================
 
 def evaluate_agent() -> None:
-    """Run the trained model without exploration."""
+    """Evaluate the apoapsis specialist with deterministic actions."""
 
-    env = OrbitCorrectionEnv()
-    model = PPO.load(MODEL_TO_EVALUATE)
+    env = ApoapsisSpecialistEnv()
+    model = PPO.load(MODEL_TO_EVALUATE, device="cpu")
 
     successes = 0
     final_errors: list[float] = []
+    remaining_fuel: list[float] = []
 
     try:
         for episode in range(EVALUATION_EPISODES):
@@ -668,7 +890,11 @@ def evaluate_agent() -> None:
             final_info: dict[str, Any] = {}
 
             while not (terminated or truncated):
-                action, _ = model.predict(observation, deterministic=True)
+                action, _ = model.predict(
+                    observation,
+                    deterministic=True,
+                )
+
                 (
                     observation,
                     _reward,
@@ -680,16 +906,24 @@ def evaluate_agent() -> None:
             success = bool(final_info.get("success", False))
             successes += int(success)
 
-            final_error = float(final_info.get("total_error", np.nan))
+            final_error = float(
+                final_info.get("absolute_apoapsis_error", np.nan)
+            )
             final_errors.append(final_error)
+
+            fuel_fraction = float(
+                final_info.get("fuel_fraction", np.nan)
+            )
+            remaining_fuel.append(fuel_fraction)
 
             print(
                 f"\nEvaluation episode {episode + 1}:"
                 f"\n  Success: {success}"
-                f"\n  Final combined error: {final_error:.0f} m"
-                f"\n  Fuel remaining: "
-                f"{float(final_info.get('fuel_fraction', 0.0)):.3f}"
-                f"\n  Target: {reset_info['target_periapsis'] / 1000:.1f} x "
+                f"\n  Final AP error: {final_error:.0f} m"
+                f"\n  Fuel remaining: {fuel_fraction:.3f}"
+                f"\n  Starting AP: "
+                f"{reset_info['starting_apoapsis'] / 1000:.1f} km"
+                f"\n  Target AP: "
                 f"{reset_info['target_apoapsis'] / 1000:.1f} km"
             )
 
@@ -699,8 +933,10 @@ def evaluate_agent() -> None:
             "\nEvaluation summary:"
             f"\n  Success rate: {successes}/{EVALUATION_EPISODES} "
             f"({success_rate:.1f}%)"
-            f"\n  Mean final combined error: "
+            f"\n  Mean final AP error: "
             f"{np.nanmean(final_errors):.0f} m"
+            f"\n  Mean remaining fuel: "
+            f"{np.nanmean(remaining_fuel):.3f}"
         )
     finally:
         env.close()
@@ -711,13 +947,13 @@ def evaluate_agent() -> None:
 # =============================================================================
 
 def check_environment() -> None:
-    """Verify that the environment follows the Gymnasium interface."""
+    """Verify the Gymnasium interface using SB3's checker."""
 
-    env = OrbitCorrectionEnv()
+    env = ApoapsisSpecialistEnv()
 
     try:
         check_env(env, warn=True, skip_render_check=True)
-        print("\nThe environment passed the Stable-Baselines3 checker.")
+        print("\nThe environment passed the SB3 environment checker.")
     finally:
         env.close()
 
