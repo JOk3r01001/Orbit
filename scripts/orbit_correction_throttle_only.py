@@ -20,7 +20,7 @@ from stable_baselines3.common.monitor import Monitor
 # =============================================================================
 
 # Choose: "check", "train", or "evaluate"
-RUN_MODE = "check"
+RUN_MODE = "train"
 
 # Name of the KSP save loaded at the beginning of every episode.
 KSP_SAVE_NAME = "orbit_training_start"
