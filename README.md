@@ -1,8 +1,21 @@
 # KSP Launch Pilot — Training Guide
 
-This README covers only the training of the first reinforcement-learning pilot: the **launch and lift-off pilot**.
+> **Work in progress:** This training guide is under active development and may change as the launch pilot is implemented and tested.
 
-The pilot is responsible for taking a rocket from the launchpad through atmospheric ascent and placing it into a safe preliminary orbit or handoff state. Orbital corrections, transfers, landing, and LLM mission-command logic are outside the scope of this document.
+## Scope
+
+This README covers only the **first launch/lift-off pilot**.
+
+The pilot is responsible for taking a rocket from the launchpad through atmospheric ascent and placing it into a safe preliminary orbit or handoff state.
+
+It does not cover:
+
+- orbital apoapsis/periapsis correction,
+- Mun or interplanetary transfers,
+- landing,
+- PID attitude-control baselines,
+- LLM commander integration,
+- automatic controller switching.
 
 ---
 
@@ -603,17 +616,3 @@ Before presenting results:
 - [ ] Compare the best checkpoint with a simple scripted baseline.
 - [ ] Record at least one complete successful flight.
 
----
-
-## Scope
-
-This README covers only the **first launch/lift-off pilot**.
-
-It does not cover:
-
-- orbital apoapsis/periapsis correction,
-- Mun or interplanetary transfers,
-- landing,
-- PID attitude-control baselines,
-- LLM commander integration,
-- automatic controller switching.
