@@ -60,7 +60,7 @@ MODEL_TO_EVALUATE = FINAL_MODEL_PATH + ".zip"
 EVALUATION_EPISODES = 20
 
 # PPO training length.
-TOTAL_TIMESTEPS = 500_000
+TOTAL_TIMESTEPS = 250_000
 
 # One environment step waits this many real seconds for KSP physics.
 STEP_DURATION = 0.20
@@ -77,7 +77,7 @@ TARGET_APOAPSIS_MAX = 180_000.0
 MINIMUM_APOAPSIS_INCREASE = 10_000.0
 
 # Episode succeeds when apoapsis is within this distance of the target.
-APOAPSIS_SUCCESS_TOLERANCE = 2_000.0
+APOAPSIS_SUCCESS_TOLERANCE = 1_000.0
 
 # Episode fails when apoapsis exceeds the target by more than this amount.
 MAX_APOAPSIS_OVERSHOOT = 5_000.0
@@ -100,7 +100,7 @@ PROGRESS_REWARD_CLIP = 2.0
 FUEL_PENALTY_SCALE = 0.003
 TIME_PENALTY = 0.001
 SUCCESS_REWARD = 100.0
-FAILURE_PENALTY = 100.0
+FAILURE_PENALTY = 150.0
 
 # Resource names used to calculate fuel fraction.
 FUEL_RESOURCES = ("LiquidFuel", "Oxidizer")
