@@ -1,27 +1,3 @@
-"""
-apoapsis_specialist.py
-
-PPO specialist for one orbital task only:
-
-    Raise the vessel's apoapsis to a requested target.
-
-The model does NOT try to control periapsis as a goal. Periapsis is read only
-for safety, so the episode can stop if the orbit enters Kerbin's atmosphere.
-A separate future periapsis specialist should be trained for periapsis changes,
-and a high-level commander/LLM can switch between the two specialists.
-
-Control split:
-    PPO     -> throttle only
-    KSP SAS -> keeps the vessel pointing prograde
-
-Training save requirements:
-    - Named save: orbit_training_start
-    - Stable Kerbin orbit
-    - Vessel positioned shortly before periapsis
-    - Orbital engine attached and fuel available
-    - SAS/prograde mode available
-    - Throttle at zero when the save is created
-"""
 
 from __future__ import annotations
 
