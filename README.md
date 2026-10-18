@@ -1,618 +1,215 @@
-# KSP Launch Pilot — Training Guide
+# Orbit: autonomous KSP mission control
 
-> **Work in progress:** This training guide is under active development and may change as the launch pilot is implemented and tested.
+Build a flight system that accepts a mission from a person or an AI commander,
+launches a rocket into orbit, changes that orbit, and lands using engine thrust.
 
-## Scope
+The first vehicle profile is a single rocket on stock Kerbin, launching eastward
+into an 80–180 km apoapsis orbit. Powered landing will start with a throttleable
+engine and prepared descent states. Other bodies, arbitrary inclinations,
+detached-booster recovery, and full atmospheric return are later extensions.
 
-This README covers only the **first launch/lift-off pilot**.
+## Architecture
 
-The pilot is responsible for taking a rocket from the launchpad through atmospheric ascent and placing it into a safe preliminary orbit or handoff state.
-
-It does not cover:
-
-- orbital apoapsis/periapsis correction,
-- Mun or interplanetary transfers,
-- landing,
-- PID attitude-control baselines,
-- LLM commander integration,
-- automatic controller switching.
-
----
-
-## 1. Training objective
-
-The launch pilot learns to:
-
-- launch safely from the pad,
-- control throttle during ascent,
-- follow a gravity-turn trajectory,
-- maintain a useful heading,
-- stage when required,
-- raise apoapsis above the atmosphere,
-- avoid crashes, flips, and fuel waste,
-- finish in a state suitable for the next pilot.
-
-A successful episode should end when the vessel reaches the launch pilot's handoff condition, for example:
-
-- apoapsis above the atmosphere,
-- vessel still controllable,
-- sufficient fuel remaining,
-- no collision or atmospheric re-entry,
-- optionally, periapsis above the atmosphere if the launch pilot also performs circularization.
-
----
-
-## 2. System architecture
-
-```text
-KSP telemetry
-      ↓
-Gymnasium environment
-      ↓
-PPO launch policy
-      ↓
-Throttle / pitch / staging commands
-      ↓
-KSP physics
-      ↓
-Reward and next observation
+```mermaid
+flowchart TD
+    Commander[Person or AI commander] --> Task[Validated numerical mission task]
+    Task --> Supervisor[Mission supervisor]
+    Supervisor --> Launch[Launch PPO]
+    Supervisor --> Maneuver[Orbital planner and PID / autopilot]
+    Supervisor --> Landing[Landing PPO]
+    Launch --> Actuator[One owner of vessel controls]
+    Maneuver --> Actuator
+    Landing --> Actuator
+    Actuator --> KSP[KSP through kRPC]
+    KSP --> Telemetry[Telemetry and mission checks]
+    Telemetry --> Supervisor
 ```
 
-The launch pilot should make fast, low-level flight-control decisions. Higher-level mission planning should remain outside this model.
+There are three control stages, initially using two PPO policies and a
+deterministic orbital controller. A third PPO policy is optional future research.
+The commander chooses goals; the flight controllers choose flight actions.
 
----
+## Implementation status
 
-## 3. Requirements
+| Component | Current state |
+| --- | --- |
+| Structured mission commands | Implemented, with offline validation and examples |
+| Mission supervisor | Implemented coordination core with simulated test doubles; no live adapter yet |
+| Launch PPO environment | Existing kRPC environment, with command validation and terminal cutoff fixes; flight validation and retraining required |
+| Apoapsis PPO experiment | Raising-only specialist, consolidated into one implementation; not the planned orbital controller |
+| Orbital maneuver planner / PID | Planned |
+| Landing environment and PPO | Planned |
+| AI commander | Planned; a person can already write the same JSON command format |
+| Complete launch–maneuver–land mission | Planned |
 
-Install the required Python packages:
+No trained policies, KSP craft files, or training saves are included. Offline
+tests do not measure flight performance. The supervisor does not yet run the
+legacy training environments or fly a vessel.
 
-```bash
-pip install numpy gymnasium stable-baselines3 krpc tensorboard
+## Try the commander interface without KSP
+
+Use Python 3.10 or newer. Run these commands from the repository root. The
+mission package and tests use only the Python standard library.
+
+```powershell
+python -m mission_control validate examples/reach_orbit.json
+python -m mission_control validate examples/change_orbit.json
+python -m mission_control validate examples/land.json
+python -m mission_control validate examples/reach_orbit.json --launch-options
+python -m unittest discover -s tests -v
 ```
 
-You also need:
-
-- Kerbal Space Program,
-- the kRPC mod installed,
-- the kRPC server running,
-- a launch vehicle prepared for repeated training,
-- a named KSP save that can be restored at the beginning of every episode.
-
----
-
-## 4. KSP training save
-
-Create a dedicated save, for example:
-
-```text
-launch_training_start
-```
-
-The save should contain:
-
-- the rocket on the launchpad,
-- engines and staging configured correctly,
-- sufficient fuel,
-- SAS or reaction-control capability if your environment uses it,
-- no active time warp,
-- a consistent starting state for every episode.
-
-The environment should reload this save during every `reset()` call.
-
-Do not train from an important career save. Training repeatedly reloads the same state and may issue unexpected control commands while the model is exploring.
-
----
-
-## 5. Action space
-
-A simple continuous action space can use:
-
-```text
-action[0] = throttle command
-action[1] = pitch command
-```
-
-For Stable-Baselines3 PPO, both outputs can be represented in the range `[-1, 1]`.
-
-Example conversion:
-
-```python
-throttle = (action[0] + 1.0) / 2.0
-pitch_input = float(action[1])
-```
-
-This maps:
-
-```text
-throttle action -1.0 → 0% throttle
-throttle action  0.0 → 50% throttle
-throttle action  1.0 → 100% throttle
-```
-
-Staging can be handled in one of two ways:
-
-1. **Rule-based staging** — activate the next stage when current-stage fuel is nearly empty.
-2. **Learned staging** — add another action output and let the policy decide when to stage.
-
-For the first working version, rule-based staging is usually easier and safer.
-
----
-
-## 6. Observation space
-
-The observation vector should contain enough information for the policy to understand the rocket's motion, trajectory, remaining resources, and current controls.
-
-A practical launch observation vector may include:
-
-```text
-altitude
-vertical speed
-horizontal speed
-apoapsis altitude
-periapsis altitude
-time to apoapsis
-pitch
-heading error
-roll or angular velocity
-fuel fraction
-current mass
-available thrust
-throttle
-current stage
-```
-
-Normalize large values before passing them to PPO.
-
-Example:
-
-```python
-observation = np.array(
-    [
-        altitude / 150_000.0,
-        vertical_speed / 2_000.0,
-        horizontal_speed / 3_000.0,
-        apoapsis / 150_000.0,
-        periapsis / 150_000.0,
-        time_to_apoapsis / 300.0,
-        pitch / 90.0,
-        heading_error / 180.0,
-        fuel_fraction,
-        mass / initial_mass,
-        available_thrust / thrust_scale,
-        current_throttle,
-        stage_fraction,
-    ],
-    dtype=np.float32,
-)
-
-observation = np.clip(observation, -1.0, 1.0)
-```
-
-The normalization constants should match the expected range of your rocket and mission.
-
----
-
-## 7. Reward design
-
-The reward should encourage useful progress rather than only rewarding elapsed time or altitude.
-
-A good starting reward can combine:
-
-```text
-positive:
-- altitude progress
-- apoapsis progress
-- horizontal-speed progress after the gravity turn
-- pointing near the desired trajectory
-- reaching the handoff condition
-
-negative:
-- fuel consumption
-- excessive angular motion
-- large heading error
-- descending during ascent
-- unsafe periapsis
-- crashing
-- running out of fuel
-- exceeding the episode limit
-```
-
-Example structure:
-
-```python
-reward = 0.0
-
-reward += altitude_progress / 1_000.0
-reward += apoapsis_progress / 1_000.0
-reward += horizontal_speed_progress / 500.0
-
-reward -= throttle * fuel_penalty_scale
-reward -= abs(heading_error) * heading_penalty_scale
-reward -= angular_velocity * instability_penalty_scale
-reward -= time_penalty
-
-if success:
-    reward += 100.0
-
-if crashed:
-    reward -= 100.0
-```
-
-Use progress rewards based on the difference between the previous and current state:
-
-```python
-altitude_progress = current_altitude - previous_altitude
-apoapsis_progress = current_apoapsis - previous_apoapsis
-```
-
-This is usually safer than rewarding raw altitude or apoapsis every step, which can cause rewards to grow simply because an episode lasts longer.
-
----
-
-## 8. Episode termination
-
-Terminate the episode when one of these conditions occurs.
-
-### Success
-
-Examples:
-
-```text
-apoapsis above target altitude
-periapsis above minimum altitude
-vessel remains controllable
-fuel remains above a minimum reserve
-```
-
-### Failure
-
-Examples:
-
-```text
-vessel crashes
-vessel begins uncontrolled descent
-rocket flips beyond a safe angle
-fuel is depleted before success
-periapsis becomes unrecoverably low
-vehicle is destroyed
-```
-
-### Truncation
-
-Use truncation when the maximum episode length is reached:
-
-```python
-truncated = episode_steps >= max_episode_steps
-```
-
-Gymnasium expects:
-
-```python
-observation, reward, terminated, truncated, info
-```
-
----
-
-## 9. Recommended curriculum
-
-Do not begin with the full launch problem if the policy cannot yet produce stable behavior.
-
-### Stage 1 — Vertical lift-off
-
-Train the pilot to:
-
-- use throttle,
-- remain approximately vertical,
-- climb without crashing.
-
-### Stage 2 — Controlled pitch-over
-
-Introduce a target pitch profile and reward:
-
-- gradual pitch reduction,
-- low heading error,
-- controlled angular velocity.
-
-### Stage 3 — Apoapsis targeting
-
-Train the policy to:
-
-- raise apoapsis toward a target,
-- reduce throttle near the target,
-- avoid overshooting excessively.
-
-### Stage 4 — Full atmospheric ascent
-
-Combine:
-
-- throttle control,
-- gravity turn,
-- heading control,
-- staging,
-- apoapsis targeting.
-
-### Stage 5 — Randomization
-
-Randomize selected conditions:
-
-- vehicle mass,
-- fuel load,
-- engine thrust,
-- target orbit,
-- small initial heading errors,
-- aerodynamic disturbances.
-
-Increase difficulty gradually. Keep evaluation conditions separate from training conditions.
-
----
-
-## 10. PPO training configuration
-
-A reasonable starting configuration is:
-
-```python
-model = PPO(
-    policy="MlpPolicy",
-    env=env,
-    learning_rate=1e-4,
-    n_steps=1024,
-    batch_size=256,
-    n_epochs=10,
-    gamma=0.999,
-    gae_lambda=0.95,
-    clip_range=0.2,
-    ent_coef=0.01,
-    vf_coef=0.5,
-    max_grad_norm=0.5,
-    policy_kwargs={
-        "net_arch": {
-            "pi": [128, 128],
-            "vf": [128, 128],
-        }
-    },
-    tensorboard_log="training_output/tensorboard",
-    verbose=1,
-    seed=42,
-)
-```
-
-These values are only a starting point. The best configuration depends on:
-
-- simulation step duration,
-- episode length,
-- reward scale,
-- observation normalization,
-- rocket dynamics.
-
----
-
-## 11. Environment validation
-
-Before long training runs, validate the Gymnasium environment:
-
-```python
-from stable_baselines3.common.env_checker import check_env
-
-env = KSPLaunchEnv()
-check_env(env, warn=True, skip_render_check=True)
-```
-
-The checker may execute random actions. Make sure every reset safely restores the launch save.
-
----
-
-## 12. Starting training
-
-Example:
-
-```bash
-python train_launch_pilot.py
-```
-
-Or, if the training script supports command-line arguments:
-
-```bash
-python train_launch_pilot.py train \
-    --save-name launch_training_start \
-    --total-timesteps 500000 \
-    --output-dir launch_training_output
-```
-
-The exact script name and arguments should match your implementation.
-
----
-
-## 13. Checkpoints
-
-Save checkpoints regularly:
-
-```python
-from stable_baselines3.common.callbacks import CheckpointCallback
-
-checkpoint_callback = CheckpointCallback(
-    save_freq=25_000,
-    save_path="launch_training_output/checkpoints",
-    name_prefix="launch_ppo",
-)
-```
-
-Train with:
-
-```python
-model.learn(
-    total_timesteps=500_000,
-    callback=checkpoint_callback,
-)
-```
-
-Do not assume the final checkpoint is the best checkpoint. Evaluate several saved models independently.
-
----
-
-## 14. TensorBoard
-
-Start TensorBoard with:
-
-```bash
-tensorboard --logdir launch_training_output/tensorboard
-```
-
-Useful PPO metrics include:
-
-```text
-rollout/ep_rew_mean
-rollout/ep_len_mean
-train/approx_kl
-train/clip_fraction
-train/entropy_loss
-train/explained_variance
-train/policy_gradient_loss
-train/value_loss
-```
-
-Project-specific metrics should also be logged:
-
-```text
-launch/success_rate
-launch/final_apoapsis_error
-launch/final_periapsis
-launch/fuel_fraction
-launch/max_heading_error
-launch/max_angular_velocity
-launch/time_to_handoff
-launch/staging_failures
-```
-
----
-
-## 15. Interpreting unstable training
-
-Watch for this pattern:
-
-```text
-episode reward rises
-episode length rises
-value loss becomes extremely large
-explained variance remains near zero
-```
-
-This can mean the critic is failing to predict returns, even though the total reward appears to improve.
-
-Possible causes include:
-
-- rewards that grow with episode length,
-- very large terminal rewards,
-- unnormalized observations,
-- reward terms with very different scales,
-- unstable or discontinuous episode resets,
-- sparse success events,
-- excessive learning rate,
-- overly long rollouts.
-
-Useful responses include:
-
-- normalize observations,
-- reduce reward magnitudes,
-- use progress-based rewards,
-- shorten the first curriculum,
-- reduce the learning rate,
-- compare earlier checkpoints,
-- evaluate with deterministic actions.
-
----
-
-## 16. Evaluation
-
-Training reward is not enough. Evaluate the pilot separately with learning disabled.
-
-Use:
-
-```python
-action, _ = model.predict(
-    observation,
-    deterministic=True,
-)
-```
-
-Run multiple episodes and report:
-
-```text
-success rate
-mean final apoapsis error
-mean final periapsis
-mean fuel remaining
-mean time to handoff
-crash rate
-staging failure rate
-```
-
-A useful minimum evaluation is 100 independent flights.
-
-Example result format:
-
-```text
-Launch success rate: 82 / 100
-Mean apoapsis error: 3.4 km
-Mean remaining fuel: 21%
-Crash rate: 7%
-Mean time to handoff: 164 seconds
-```
-
----
-
-## 17. Suggested handoff contract
-
-The launch pilot should produce a clear state for the next pilot.
-
-Example handoff condition:
-
-```python
-handoff_ready = (
-    apoapsis >= target_apoapsis - tolerance
-    and vessel_is_stable
-    and fuel_fraction >= minimum_fuel_reserve
-)
-```
-
-The launch pilot can then stop controlling the vessel and return a status object:
-
-```python
-handoff = {
-    "pilot": "launch",
-    "status": "complete",
-    "apoapsis": current_apoapsis,
-    "periapsis": current_periapsis,
-    "fuel_fraction": fuel_fraction,
-    "next_pilot": "orbit_correction",
+`validate` checks the schema and the first profile's numerical limits. It does
+not check vehicle performance, fuel feasibility, policy availability, or whether
+KSP is running. Invalid commands exit with code 2. Nothing connects to KSP.
+
+Example mission:
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "launch-001",
+  "task": "reach_orbit",
+  "body": "Kerbin",
+  "target": {
+    "apoapsis_m": 120000,
+    "periapsis_m": 100000
+  },
+  "minimum_fuel_fraction": 0.02,
+  "urgency": 0.5,
+  "timeout_s": 900,
+  "settle_time_s": 3
 }
 ```
 
-This keeps the first pilot separate from later orbital maneuver models.
+Unknown fields, non-finite numbers, unsupported bodies, and out-of-range goals
+are rejected. Constraints are never silently reduced. Fuel fraction is a
+prototype measure relative to the starting load, not a delta-v guarantee.
 
----
+The orbit targets currently describe apoapsis/periapsis altitudes above sea
+level, not distances from the planet's center. Landing targets use degrees and
+meters. See [the architecture contract](docs/architecture.md) for telemetry,
+controller ownership, and handoff requirements.
 
-## 18. Training checklist
+## Run flight training when KSP is ready
 
-Before training:
+Create an isolated environment and install the optional flight dependencies:
 
-- [ ] kRPC server is running.
-- [ ] The correct vessel is active.
-- [ ] The launch save exists.
-- [ ] Engines and staging are configured.
-- [ ] `reset()` reloads the vessel correctly.
-- [ ] Observations contain finite values.
-- [ ] Observations match `observation_space`.
-- [ ] Actions match `action_space`.
-- [ ] Throttle is set to zero on termination.
-- [ ] Crashes and success are detected correctly.
-- [ ] Checkpoints and TensorBoard directories exist.
-- [ ] The environment passes `check_env`.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[training]"
+```
 
-Before presenting results:
+The commands below assume the environment is activated, KSP is running, and the
+kRPC server is installed and enabled. Do not run flight commands as offline
+tests: environment resets load KSP saves and may launch or stage the vessel.
 
-- [ ] Evaluate deterministic checkpoints.
-- [ ] Report success rate over many flights.
-- [ ] Include fuel and trajectory metrics.
-- [ ] Compare the best checkpoint with a simple scripted baseline.
-- [ ] Record at least one complete successful flight.
+### Launch policy
 
+Prepare a named save, `launchpad_ready`, containing the correctly staged rocket
+on the pad. The current script uses a 16-value observation and two actions in
+`[0, 1]`: throttle and pitch fraction. Heading is fixed eastward; staging and
+attitude stabilization use scripted helpers and KSP autopilot.
+
+Check the environment before a long run:
+
+```powershell
+python -m scripts.check_launch
+python -m scripts.orbit_command
+```
+
+Launch training currently reads settings from `scripts/orbit_command.py`.
+It resumes `ppo_ksp_commanded_pilot_v4.zip` if present; otherwise it starts fresh.
+Periodic checkpoints go into `models_v4/`. Completion and Ctrl+C save the main
+model and `_latest` model. To resume a periodic checkpoint, copy the chosen
+checkpoint to the main model filename before starting. Keep the original.
+
+Evaluate a selected checkpoint:
+
+```powershell
+python -m scripts.test_orbit --model ppo_ksp_commanded_pilot_v4.zip
+```
+
+This runs six deterministic target-orbit cases from the same launch save.
+It is a smoke evaluation, not a robust estimate of generalization.
+
+`env.reset(options=task.launch_options())` selects a goal and reloads a training
+save. `env.set_command(task.launch_options())` changes the current environment's
+goal without loading a save or staging. The latter is a command update API,
+not a complete deployment runner. Do not run this environment concurrently with
+the mission supervisor: it writes directly to KSP controls.
+
+Tighter orbit tolerances can be requested, but the existing training curriculum
+uses 10 km tolerances. A policy's accuracy must be measured before claiming it
+can satisfy tighter requests.
+
+### Legacy apoapsis specialist
+
+Prepare `orbit_training_start` in a stable Kerbin orbit with a usable engine and
+prograde SAS. Settings live in `scripts/apoapsis_brain.py`.
+
+```powershell
+python -m scripts.apoapsis_brain check
+python -m scripts.apoapsis_brain train --timesteps 250000
+python -m scripts.apoapsis_brain train --resume apoapsis_specialist_output/checkpoints/apoapsis_specialist_25000_steps.zip --timesteps 250000
+python -m scripts.apoapsis_brain evaluate
+```
+
+`--timesteps` specifies additional training steps. Evaluation uses
+`MODEL_TO_EVALUATE` in the settings. `scripts/apoapsis_specialist.py` remains a
+compatibility entry point for the same implementation. This experiment only
+raises apoapsis; it does not implement arbitrary maneuvers or deorbit burns.
+
+## Milestones and evidence
+
+1. **Commander and supervisor foundation:** strict commands, exclusive control,
+   abort/failure handling, and offline regression tests. Implemented core;
+   live integration remains.
+2. **Reliable launch:** install kRPC, validate resets and physics timing, add a
+   scripted baseline and a live launch adapter, retrain, then evaluate held-out
+   targets and starting conditions. Verify orbit and reserve with engines off.
+3. **Orbital maneuvers:** plan and execute apoapsis/periapsis changes, compare
+   accuracy and propellant use with the PPO specialist, and add deorbit planning.
+4. **Powered landing:** begin with low-altitude vertical descents, then introduce
+   horizontal velocity, target location, mass, and thrust variation. Train on
+   states produced by the preceding controller before connecting the stages.
+5. **Complete missions:** connect validated handoffs, add natural-language task
+   translation, and publish reproducible results and failure examples.
+
+Record success counts, orbit errors, fuel remaining, touchdown speeds, landing
+distance, interventions, and failure reasons. Compare learned policies with
+simple scripted/PID baselines on the same conditions. Keep evaluation conditions
+separate from training. A complete mission needs its own success rate in addition
+to each controller's results.
+
+## Keep training recoverable
+
+Model `.zip` files and generated training outputs are intentionally ignored by
+Git. A source-code push does **not** back them up. Store selected checkpoints in
+an off-machine backup or an artifact release before reinstalling an OS.
+
+Keep the checkpoint together with the Git commit, Python/package versions,
+training settings and seed, KSP/kRPC/mod versions, craft, training saves, and
+evaluation report. If observation normalization is added, retain its statistics
+too. Capture the installed training environment after setup:
+
+```powershell
+python -m pip freeze > requirements-training.lock.txt
+```
+
+The repository declares dependencies but does not yet contain a flight-validated
+dependency lock. Checkpoint continuation is supported; exact reproduction of
+the interrupted simulator trajectory is not guaranteed.
+
+## Repository map
+
+- `mission_control/`: dependency-free tasks, validation CLI, and supervisor core.
+- `examples/`: mission JSON for each planned control stage.
+- `scripts/orbit_command.py`: existing launch training environment and PPO runner.
+- `scripts/test_orbit.py`: deterministic launch evaluation.
+- `scripts/apoapsis_brain.py`: canonical legacy apoapsis experiment.
+- `tests/`: offline contract, supervisor, and training regression tests.
+- `data_train/`: existing flight recordings; not PPO checkpoints and not consumed
+  by the current on-policy training scripts.
+- [Launch training design notes](docs/launch-training-design.md): original
+  curriculum and reward-design reference, with illustrative configurations.

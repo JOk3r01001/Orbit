@@ -1,0 +1,15 @@
+{
+  "task_id": "landing-001",
+  "task": "land",
+  "target": {
+    "latitude_deg": -0.0972,
+    "longitude_deg": -74.5577,
+    "radius_m": 500,
+    "max_vertical_speed_mps": 2,
+    "max_horizontal_speed_mps": 1,
+    "max_tilt_deg": 10
+  },
+  "minimum_fuel_fraction": 0,
+  "timeout_s": 300,
+  "settle_time_s": 3
+}

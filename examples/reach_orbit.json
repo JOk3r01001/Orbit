@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_id": "launch-001",
+  "task": "reach_orbit",
+  "body": "Kerbin",
+  "target": {
+    "apoapsis_m": 120000,
+    "periapsis_m": 100000
+  },
+  "minimum_fuel_fraction": 0.02,
+  "urgency": 0.5,
+  "timeout_s": 900,
+  "settle_time_s": 3
+}

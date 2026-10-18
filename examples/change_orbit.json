@@ -1,0 +1,12 @@
+{
+  "task_id": "maneuver-001",
+  "task": "change_orbit",
+  "target": {
+    "apoapsis_m": 150000,
+    "periapsis_m": 120000,
+    "apoapsis_tolerance_m": 1000,
+    "periapsis_tolerance_m": 1000
+  },
+  "minimum_fuel_fraction": 0.02,
+  "timeout_s": 3600
+}

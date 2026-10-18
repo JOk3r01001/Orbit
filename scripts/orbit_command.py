@@ -8,6 +8,11 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
+if __package__:
+    from .launch_command import validate_launch_command
+else:
+    from launch_command import validate_launch_command
+
 
 class KSPCommandedOrbitalEnv(gym.Env):
     """
@@ -40,7 +45,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, randomize_commands=True):
+    def __init__(self, randomize_commands=True, save_name="launchpad_ready"):
         super().__init__()
 
         print("Connecting to KSP for commanded reinforcement learning...")
@@ -68,6 +73,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         # Allowed commander target ranges
         self.randomize_commands = randomize_commands
+        self.save_name = save_name
         self.minimum_target_ap = 80_000.0
         self.maximum_target_ap = 180_000.0
         self.minimum_target_pe = 70_000.0
@@ -127,6 +133,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         self.pe_positive_awarded = False
         self.pe_50k_awarded = False
         self.pe_near_target_awarded = False
+        self._episode_finished = True
 
     def set_training_timesteps(self, timesteps):
         """Receive the current SB3 timestep count from the callback."""
@@ -187,13 +194,22 @@ class KSPCommandedOrbitalEnv(gym.Env):
     # --------------------------------------------------
 
     def reset(self, seed=None, options=None):
+        self._episode_finished = True
+        self._stop_throttle()
+        try:
+            return self._reset(seed=seed, options=options)
+        except BaseException:
+            self._stop_throttle()
+            raise
+
+    def _reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
         # Select a random training command or use an external command
         self._select_command(options)
 
         print("\nLoading launchpad save...")
-        self.conn.space_center.load("launchpad_ready")
+        self.conn.space_center.load(self.save_name)
         time.sleep(2.0)
 
         self._rebind_vessel_objects()
@@ -260,14 +276,30 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         observation = self._get_obs()
         info = self._command_info()
+        self._episode_finished = False
 
         return observation, info
+
+    def set_command(self, options):
+        """Accept a numerical mission goal without loading a save or staging.
+
+        This updates the current environment's goal; it is not a live-flight
+        runner. Validation is atomic and never weakens the requested reserve.
+        """
+        values = validate_launch_command(options)
+        self.command_target_ap = values["target_ap"]
+        self.command_target_pe = values["target_pe"]
+        self.command_min_fuel_fraction = values["min_fuel_fraction"]
+        self.command_urgency = values["urgency"]
+        self.ap_tolerance = values["ap_tolerance"]
+        self.pe_tolerance = values["pe_tolerance"]
+        self._reset_reward_milestones()
 
     def _select_command(self, options):
         """
         During training, commands are sampled from a three-stage curriculum.
 
-        During deployment, an external command can be supplied through:
+        For training/evaluation, an external command can be supplied through:
 
         env.reset(
             options={
@@ -279,70 +311,13 @@ class KSPCommandedOrbitalEnv(gym.Env):
         )
         """
 
-        # External command supplied by an LLM or mission manager
-        if options is not None and "target_ap" in options:
-            self.command_target_ap = float(
-                np.clip(
-                    options["target_ap"],
-                    self.minimum_target_ap,
-                    self.maximum_target_ap,
-                )
-            )
-
-            self.command_target_pe = float(
-                np.clip(
-                    options.get(
-                        "target_pe",
-                        self.minimum_target_pe,
-                    ),
-                    self.minimum_target_pe,
-                    self.command_target_ap,
-                )
-            )
-
-            feasible_fuel_maximum = (
-                self._maximum_feasible_fuel_requirement(
-                    self.command_target_ap,
-                    self.command_target_pe,
-                )
-            )
-
-            requested_fuel = float(
-                np.clip(
-                    options.get(
-                        "min_fuel_fraction",
-                        0.0,
-                    ),
-                    0.0,
-                    self.maximum_minimum_fuel_fraction,
-                )
-            )
-
-            self.command_min_fuel_fraction = min(
-                requested_fuel,
-                feasible_fuel_maximum,
-            )
-
-            if requested_fuel > feasible_fuel_maximum:
-                print(
-                    "MISSION MANAGER | Requested fuel requirement "
-                    f"{requested_fuel:.2f} was reduced to the "
-                    f"feasible maximum {feasible_fuel_maximum:.2f}."
-                )
-
-            self.command_urgency = float(
-                np.clip(
-                    options.get(
-                        "urgency",
-                        0.5,
-                    ),
-                    0.0,
-                    1.0,
-                )
-            )
+        # An empty options object means no external command, as in Gymnasium.
+        if options:
+            self.set_command(options)
 
         # Random command used during PPO training
         elif self.randomize_commands:
+            self.ap_tolerance = self.pe_tolerance = 10_000.0
             if self.curriculum_stage == 1:
                 target_ap_minimum = 95_000.0
                 target_ap_maximum = 105_000.0
@@ -438,6 +413,16 @@ class KSPCommandedOrbitalEnv(gym.Env):
     # --------------------------------------------------
 
     def step(self, action):
+        if self._episode_finished:
+            raise RuntimeError("Call reset() before stepping a new episode")
+        try:
+            return self._step(action)
+        except BaseException:
+            self._episode_finished = True
+            self._stop_throttle()
+            raise
+
+    def _step(self, action):
         self.current_step += 1
 
         terminated = False
@@ -571,8 +556,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
         orbit_within_tolerance = (
             ap_error <= self.ap_tolerance
             and pe_error <= self.pe_tolerance
-            and pe >= 70_000.0
-            and alt >= 70_000.0
+            and pe > 70_000.0
+            and alt > 70_000.0
         )
 
         # --------------------------------------------------
@@ -831,6 +816,10 @@ class KSPCommandedOrbitalEnv(gym.Env):
             ),
             **self._command_info(),
         }
+
+        if terminated or truncated:
+            self._episode_finished = True
+            self.vessel.control.throttle = 0.0
 
         return (
             observation,
@@ -1773,14 +1762,16 @@ class KSPCommandedOrbitalEnv(gym.Env):
             - 180.0
         )
 
-    def close(self):
+    def _stop_throttle(self):
         try:
             if self.vessel is not None:
                 self.vessel.control.throttle = 0.0
-
         except Exception:
             pass
 
+    def close(self):
+        self._episode_finished = True
+        self._stop_throttle()
         try:
             if self.conn is not None:
                 self.conn.close()
@@ -2035,6 +2026,7 @@ if __name__ == "__main__":
         )
 
         model.save(model_path)
+        model.save(model_path + "_latest")
 
         print(
             f"Training complete. "

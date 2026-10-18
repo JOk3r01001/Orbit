@@ -1,11 +1,16 @@
 from collections import Counter
+import argparse
+from pathlib import Path
 
 from stable_baselines3 import PPO
 
-from orbit_command import KSPCommandedOrbitalEnv
+if __package__:
+    from .orbit_command import KSPCommandedOrbitalEnv
+else:
+    from orbit_command import KSPCommandedOrbitalEnv
 
 
-MODEL_PATH = "./ppo_ksp_commanded_pilot_v4_latest"
+MODEL_PATH = "./ppo_ksp_commanded_pilot_v4"
 
 
 EVAL_COMMANDS = [
@@ -146,29 +151,34 @@ def run_eval_episode(model, env, command, episode_index):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate a launch checkpoint on six deterministic orbit commands")
+    parser.add_argument("--model", default=MODEL_PATH, help="PPO checkpoint path, with or without .zip")
+    args = parser.parse_args()
+    model_file = Path(args.model if args.model.endswith(".zip") else args.model + ".zip")
+    if not model_file.is_file():
+        parser.error(f"Checkpoint not found: {model_file}")
+
     env = KSPCommandedOrbitalEnv(
         randomize_commands=False,
     )
 
-    model = PPO.load(
-        MODEL_PATH,
-        env=env,
-        device="cpu",
-    )
-
     results = []
-
-    for index, command in enumerate(EVAL_COMMANDS, start=1):
-        result = run_eval_episode(
-            model=model,
+    try:
+        model = PPO.load(
+            str(model_file),
             env=env,
-            command=command,
-            episode_index=index,
+            device="cpu",
         )
-
-        results.append(result)
-
-    env.close()
+        for index, command in enumerate(EVAL_COMMANDS, start=1):
+            result = run_eval_episode(
+                model=model,
+                env=env,
+                command=command,
+                episode_index=index,
+            )
+            results.append(result)
+    finally:
+        env.close()
 
     total = len(results)
     successes = sum(result["success"] for result in results)

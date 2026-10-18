@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbit-mission-control"
+version = "0.1.0"
+description = "Goal-conditioned KSP flight control and mission supervision"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+training = ["numpy", "gymnasium", "stable-baselines3", "krpc", "tensorboard"]
+
+[project.scripts]
+orbit-mission = "mission_control.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mission_control*", "scripts*"]
+exclude = ["tests*"]

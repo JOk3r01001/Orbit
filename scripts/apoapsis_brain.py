@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+import argparse
 from typing import Any
 
 import gymnasium as gym
@@ -175,6 +176,7 @@ class ApoapsisSpecialistEnv(gym.Env):
         # Loading a save invalidates old kRPC object references.
         self.vessel = self.space_center.active_vessel
         self.control = self.vessel.control
+        self.control.throttle = 0.0
         self.orbit = self.vessel.orbit
 
         self._activate_available_engines()
@@ -339,20 +341,30 @@ class ApoapsisSpecialistEnv(gym.Env):
     # TARGET AND OBSERVATION
     # -------------------------------------------------------------------------
 
-    def _choose_target(self, telemetry: dict[str, float]) -> None:
-        """Choose a higher random apoapsis target for this episode."""
+    def _choose_target(self, telemetry: dict[str, float], options=None) -> None:
+        """Choose a higher target, preserving explicitly supplied commands."""
 
         starting_apoapsis = telemetry["apoapsis"]
+
+        if options:
+            if not isinstance(options, dict) or set(options) != {"target_apoapsis"}:
+                raise ValueError("Apoapsis options must contain only target_apoapsis")
+            target = options["target_apoapsis"]
+            if isinstance(target, bool) or not isinstance(target, (int, float)) or not np.isfinite(target):
+                raise ValueError("target_apoapsis must be a finite number")
+            if not max(TARGET_APOAPSIS_MIN, starting_apoapsis + MINIMUM_APOAPSIS_INCREASE) <= target <= TARGET_APOAPSIS_MAX:
+                raise ValueError("Requested apoapsis is outside the supported raising-only target range")
+            self.target_apoapsis = float(target)
+            return
 
         lowest_target = max(
             TARGET_APOAPSIS_MIN,
             starting_apoapsis + MINIMUM_APOAPSIS_INCREASE,
         )
 
-        highest_target = max(
-            TARGET_APOAPSIS_MAX,
-            lowest_target + 1_000.0,
-        )
+        highest_target = TARGET_APOAPSIS_MAX
+        if lowest_target >= highest_target:
+            raise ValueError("Training save starts too high for the configured apoapsis curriculum")
 
         self.target_apoapsis = float(
             self.np_random.uniform(lowest_target, highest_target)
@@ -528,7 +540,7 @@ class ApoapsisSpecialistEnv(gym.Env):
         time_penalty = TIME_PENALTY
 
         # Success depends only on apoapsis precision.
-        success = absolute_apoapsis_error <= APOAPSIS_SUCCESS_TOLERANCE
+        within_tolerance = absolute_apoapsis_error <= APOAPSIS_SUCCESS_TOLERANCE
 
         # Apoapsis-specific failure guard.
         apoapsis_overshoot = (
@@ -538,17 +550,17 @@ class ApoapsisSpecialistEnv(gym.Env):
 
         # Periapsis remains safety-only, not a learned target.
         unsafe_periapsis = (
-            telemetry["periapsis"] < MINIMUM_SAFE_PERIAPSIS
+            telemetry["periapsis"] <= MINIMUM_SAFE_PERIAPSIS
         )
 
         out_of_fuel = (
             telemetry["fuel_fraction"] <= 0.001
-            and not success
+            and not within_tolerance
         )
 
         no_thrust = (
             telemetry["available_thrust"] <= 0.0
-            and not success
+            and not within_tolerance
         )
 
         failure = (
@@ -557,6 +569,7 @@ class ApoapsisSpecialistEnv(gym.Env):
             or out_of_fuel
             or no_thrust
         )
+        success = within_tolerance and not failure
 
         reward = progress_reward - fuel_penalty - time_penalty
 
@@ -613,7 +626,7 @@ class ApoapsisSpecialistEnv(gym.Env):
 
         telemetry = self._telemetry()
 
-        if telemetry["periapsis"] < MINIMUM_SAFE_PERIAPSIS:
+        if telemetry["periapsis"] <= MINIMUM_SAFE_PERIAPSIS:
             raise RuntimeError(
                 "The training save is not in a safe stable orbit."
             )
@@ -624,7 +637,7 @@ class ApoapsisSpecialistEnv(gym.Env):
             )
 
         self.starting_periapsis = telemetry["periapsis"]
-        self._choose_target(telemetry)
+        self._choose_target(telemetry, options)
 
         self.previous_absolute_apoapsis_error = abs(
             self._apoapsis_error(telemetry)
@@ -775,8 +788,15 @@ class ApoapsisMetricsCallback(BaseCallback):
 # TRAINING
 # =============================================================================
 
-def train_agent() -> None:
-    """Create a new apoapsis-specialist PPO model and train it."""
+def train_agent(resume_path=None, total_timesteps=TOTAL_TIMESTEPS) -> None:
+    """Train a new policy or resume an explicitly chosen checkpoint."""
+
+    if total_timesteps <= 0:
+        raise ValueError("total_timesteps must be positive")
+    if resume_path is not None:
+        checkpoint = resume_path if resume_path.endswith(".zip") else resume_path + ".zip"
+        if not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
     os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
     os.makedirs(CHECKPOINT_DIRECTORY, exist_ok=True)
@@ -802,35 +822,46 @@ def train_agent() -> None:
 
     metrics_callback = ApoapsisMetricsCallback()
 
-    model = PPO(
-        policy="MlpPolicy",
-        env=env,
-        learning_rate=1e-4,
-        device="cpu",
-        n_steps=1024,
-        batch_size=256,
-        n_epochs=10,
-        gamma=0.999,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        policy_kwargs={
-            "net_arch": {
-                "pi": [128, 128],
-                "vf": [128, 128],
-            }
-        },
-        tensorboard_log=TENSORBOARD_DIRECTORY,
-        verbose=1,
-        seed=SEED,
-    )
+    try:
+        _train_agent(env, checkpoint_callback, metrics_callback, resume_path, total_timesteps)
+    finally:
+        env.close()
+
+
+def _train_agent(env, checkpoint_callback, metrics_callback, resume_path, total_timesteps):
+    if resume_path is not None:
+        model = PPO.load(resume_path, env=env, device="cpu", tensorboard_log=TENSORBOARD_DIRECTORY)
+    else:
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            learning_rate=1e-4,
+            device="cpu",
+            n_steps=1024,
+            batch_size=256,
+            n_epochs=10,
+            gamma=0.999,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            policy_kwargs={
+                "net_arch": {
+                    "pi": [128, 128],
+                    "vf": [128, 128],
+                }
+            },
+            tensorboard_log=TENSORBOARD_DIRECTORY,
+            verbose=1,
+            seed=SEED,
+        )
 
     try:
         model.learn(
-            total_timesteps=TOTAL_TIMESTEPS,
+            total_timesteps=total_timesteps,
             callback=[checkpoint_callback, metrics_callback],
+            reset_num_timesteps=resume_path is None,
         )
 
         model.save(FINAL_MODEL_PATH)
@@ -854,8 +885,6 @@ def train_agent() -> None:
             f"\nCurrent model saved to: {interrupted_path}.zip"
         )
 
-    finally:
-        env.close()
 
 
 # =============================================================================
@@ -866,13 +895,13 @@ def evaluate_agent() -> None:
     """Evaluate the apoapsis specialist with deterministic actions."""
 
     env = ApoapsisSpecialistEnv()
-    model = PPO.load(MODEL_TO_EVALUATE, device="cpu")
 
     successes = 0
     final_errors: list[float] = []
     remaining_fuel: list[float] = []
 
     try:
+        model = PPO.load(MODEL_TO_EVALUATE, device="cpu")
         for episode in range(EVALUATION_EPISODES):
             observation, reset_info = env.reset(seed=SEED + episode)
 
@@ -954,11 +983,20 @@ def check_environment() -> None:
 # =============================================================================
 
 def main() -> None:
-    if RUN_MODE == "check":
+    parser = argparse.ArgumentParser(description="Train or evaluate the raising-only apoapsis specialist")
+    parser.add_argument("mode", nargs="?", choices=("check", "train", "evaluate"), default=RUN_MODE)
+    parser.add_argument("--resume", help="PPO checkpoint to continue training")
+    parser.add_argument("--timesteps", type=int, default=TOTAL_TIMESTEPS, help="Additional timesteps for this run")
+    args = parser.parse_args()
+    if args.resume and args.mode != "train":
+        parser.error("--resume is only valid for train")
+    if args.timesteps <= 0:
+        parser.error("--timesteps must be positive")
+    if args.mode == "check":
         check_environment()
-    elif RUN_MODE == "train":
-        train_agent()
-    elif RUN_MODE == "evaluate":
+    elif args.mode == "train":
+        train_agent(args.resume, args.timesteps)
+    elif args.mode == "evaluate":
         evaluate_agent()
     else:
         raise ValueError(
