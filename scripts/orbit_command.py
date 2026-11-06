@@ -215,7 +215,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         self._rebind_vessel_objects()
 
         # Initial autopilot direction
-        self.vessel.auto_pilot.engage()
+        self.vessel.auto_pilot.engaged = True
         self.vessel.auto_pilot.target_pitch_and_heading(90, 90)
 
         # Reset episode counters
@@ -270,7 +270,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         self._rebind_vessel_objects()
 
-        self.vessel.auto_pilot.engage()
+        self.vessel.auto_pilot.engaged = True
         self.vessel.auto_pilot.target_pitch_and_heading(90, 90)
         self.vessel.control.throttle = 1.0
 
@@ -1590,7 +1590,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         self._rebind_vessel_objects()
 
-        self.vessel.auto_pilot.engage()
+        self.vessel.auto_pilot.engaged = True
 
     # --------------------------------------------------
     # KSP VALUE HELPERS

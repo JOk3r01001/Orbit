@@ -104,6 +104,10 @@ The commands below assume the environment is activated, KSP is running, and the
 kRPC server is installed and enabled. Do not run flight commands as offline
 tests: environment resets load KSP saves and may launch or stage the vessel.
 
+The training dependencies pin the Python kRPC client to **0.6.0**, matching the
+installed KSP mod. Keep the in-game mod and Python client on the same release.
+The 0.7 client uses a newer protocol and cannot connect to the 0.6 server.
+
 ### Launch policy
 
 Prepare a named save, `launchpad_ready`, containing the correctly staged rocket

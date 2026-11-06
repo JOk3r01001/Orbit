@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-training = ["numpy", "gymnasium", "stable-baselines3", "krpc", "tensorboard"]
+training = ["numpy", "gymnasium", "stable-baselines3", "krpc==0.6.0", "tensorboard"]
 
 [project.scripts]
 orbit-mission = "mission_control.__main__:main"

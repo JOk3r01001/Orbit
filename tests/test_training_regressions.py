@@ -10,6 +10,11 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+try:
+    from krpc.services.spacecenter import AutoPilot
+except ImportError:
+    AutoPilot = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,7 +25,11 @@ def load_training_module(filename):
                  "stable_baselines3.common", "stable_baselines3.common.callbacks",
                  "stable_baselines3.common.env_checker", "stable_baselines3.common.monitor"):
         stubs[name] = ModuleType(name)
-    stubs["gymnasium"].Env = object
+    class StubEnv:
+        def reset(self, *, seed=None, options=None):
+            pass
+
+    stubs["gymnasium"].Env = StubEnv
     stubs["gymnasium"].spaces = SimpleNamespace()
     stubs["numpy"].clip = lambda value, low, high: min(high, max(low, value))
     stubs["numpy"].isfinite = math.isfinite
@@ -41,6 +50,51 @@ class TrainingRegressionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.launch = load_training_module("orbit_command")
         cls.apoapsis = load_training_module("apoapsis_brain")
+
+    @unittest.skipIf(AutoPilot is None, "Optional kRPC client is not installed")
+    def test_reset_engages_installed_krpc_autopilot(self):
+        # Use the real generated client class with a recording RPC backend.
+        # This catches API changes that an unrestricted Mock would conceal.
+        client = Mock()
+        autopilot = AutoPilot(client, 1)
+        vessel = SimpleNamespace(
+            auto_pilot=autopilot, mass=1000, available_thrust=100,
+            control=SimpleNamespace(throttle=0, current_stage=1),
+        )
+        env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+        env.vessel = None
+        env.save_name = "launchpad_ready"
+        env.conn = Mock()
+        env._select_command = Mock()
+        env._rebind_vessel_objects = Mock(side_effect=lambda: setattr(env, "vessel", vessel))
+        env._get_liquid_fuel = lambda: 100
+        env._get_speed_values = lambda: (70, 0, 0)
+        env._safe_apoapsis = lambda: 70
+        env._safe_periapsis = lambda: -500_000
+        env._get_obs = lambda: [0] * 16
+        env._command_info = lambda: {}
+        with patch.object(self.launch.time, "sleep"), patch("builtins.print"):
+            observation, _ = env.reset(seed=0)
+        calls = [call for call in client._invoke.call_args_list if call.args[1] == "AutoPilot_set_Engaged"]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call.args[2] == [autopilot, True] for call in calls))
+        env.conn.space_center.load.assert_called_once_with("launchpad_ready")
+        self.assertEqual(len(observation), 16)
+        self.assertFalse(env._episode_finished)
+
+    @unittest.skipIf(AutoPilot is None, "Optional kRPC client is not installed")
+    def test_staging_reengages_installed_krpc_autopilot(self):
+        client = Mock()
+        autopilot = AutoPilot(client, 1)
+        env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+        env.vessel = SimpleNamespace(auto_pilot=autopilot, control=Mock())
+        env._rebind_vessel_objects = Mock()
+        with patch.object(self.launch.time, "sleep"):
+            env._activate_next_stage(now=123)
+        env.vessel.control.activate_next_stage.assert_called_once()
+        env._rebind_vessel_objects.assert_called_once()
+        self.assertEqual(env.last_stage_time, 123)
+        self.assertEqual(client._invoke.call_args.args[:3], ("SpaceCenter", "AutoPilot_set_Engaged", [autopilot, True]))
 
     def test_live_goal_update_preserves_reserve_without_ksp_calls(self):
         env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
