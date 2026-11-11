@@ -3,6 +3,11 @@
 Build a flight system that accepts a mission from a person or an AI commander,
 launches a rocket into orbit, changes that orbit, and lands using engine thrust.
 
+> **Model availability:** This repository currently contains training scripts and
+> supporting source code only; pretrained model weights are not included. Model
+> weights will be uploaded after the intended training goals have been achieved
+> and verified through evaluation.
+
 The first vehicle profile is a single rocket on stock Kerbin, launching eastward
 into an 80–180 km apoapsis orbit. Powered landing will start with a throttleable
 engine and prepared descent states. Other bodies, arbitrary inclinations,
