@@ -142,6 +142,36 @@ python -m scripts.test_orbit --model ppo_ksp_commanded_pilot_v4.zip
 This runs six deterministic target-orbit cases from the same launch save.
 It is a smoke evaluation, not a robust estimate of generalization.
 
+Monitor training with `tensorboard --logdir .\ksp_tensorboard_v4`. In addition
+to the rolling reward and success rate, `episodes/success_return` and
+`episodes/failure_return` separate completed-flight returns by outcome. These
+two metrics average the episodes completed since the last logging update.
+`reward_step/*` reports average per-step reward components, while
+`reward_episode/*` reports component totals for completed episodes. Episode
+summaries also print the full return. These diagnostics require restarting the
+training process to load the updated code; existing model weights are preserved.
+
+The completion throttle cutoff requires periapsis to be above 70 km, even when
+a low requested periapsis and its tolerance would otherwise permit an orbit
+inside the atmosphere. Burn assistance and its reward guidance use the same
+safety boundary.
+
+Reward revision **2** removes the recurring apoapsis-deficit charge: closing the
+orbital error still earns progress reward, moving away still loses reward, and
+time still has a cost. Throttle and pitch intervention coefficients are reduced
+from 0.10 to 0.01 each; all flight-control guards remain active. Coasting alone
+earns no standing bonus, and positive burn guidance is proportional to measured
+periapsis progress, so unchanged trajectories cannot earn those recurring bonuses.
+
+Revision 2 resumes the same model files and preserves the observation/action
+format, curriculum counter, and PPO hyperparameters. It writes a separate
+`PPO_reward_v2_*` run under `ksp_tensorboard_v4/` and records the revision and
+reward configuration in newly saved model metadata. Higher rewards after this
+change do not establish better flight performance; compare success rates, orbit
+errors, and fuel use. Initial rolling episode averages can include earlier
+episodes retained in the resumed checkpoint. The new code takes effect after a
+normal Ctrl+C save and restart of training.
+
 `env.reset(options=task.launch_options())` selects a goal and reloads a training
 save. `env.set_command(task.launch_options())` changes the current environment's
 goal without loading a save or staging. The latter is a command update API,

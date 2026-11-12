@@ -147,14 +147,16 @@ class TrainingRegressionTests(unittest.TestCase):
                 env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
                 env.set_command(dict(target_ap=120_000, target_pe=100_000))
                 env.current_step = 0
-                env.max_steps = 1
+                env.max_steps = 2
+                env._episode_return = 0.0
+                env._episode_reward_terms = {}
                 env.curriculum_stage = 3
                 env.maximum_ap_overshoot = 40_000
                 env.maximum_pe_overshoot = 40_000
                 env._episode_finished = False
                 env.dt = 0
-                env.throttle_intervention_penalty_scale = 0.1
-                env.pitch_intervention_penalty_scale = 0.1
+                env.throttle_intervention_penalty_scale = self.launch.THROTTLE_INTERVENTION_PENALTY_SCALE
+                env.pitch_intervention_penalty_scale = self.launch.PITCH_INTERVENTION_PENALTY_SCALE
                 env._get_speed_values = lambda: (100_000, 0, 2000)
                 env._safe_apoapsis = lambda: 120_000
                 env._safe_periapsis = lambda: 100_000 if success else 80_000
@@ -169,15 +171,172 @@ class TrainingRegressionTests(unittest.TestCase):
                 env.surface_flight = SimpleNamespace(pitch=0)
                 env._horizontal_speed = lambda speed, vertical: speed
                 env._current_fuel_fraction = lambda: 0.5
-                env._compute_reward = lambda **kwargs: 0
+                env._compute_reward = lambda **kwargs: 5.0
                 env._command_info = lambda: {}
+                episode_rewards = []
                 with patch.object(self.launch.time, "sleep"), patch("builtins.print"):
-                    _, _, terminated, truncated, info = env.step([1, 0])
+                    for _ in range(2):
+                        _, reward, terminated, truncated, info = env.step([1, 0])
+                        episode_rewards.append(reward)
+                        self.assertAlmostEqual(sum(info["reward_terms"].values()), reward)
+                        if terminated or truncated:
+                            break
                 self.assertEqual(terminated, success)
                 self.assertEqual(truncated, not success)
                 self.assertEqual(info["is_success"], success)
                 self.assertEqual(env.vessel.control.throttle, 0)
                 self.assertTrue(env._episode_finished)
+                self.assertAlmostEqual(info["episode_return"], sum(episode_rewards))
+                self.assertAlmostEqual(sum(info["episode_reward_terms"].values()), sum(episode_rewards))
+
+    def test_low_orbit_tolerance_cannot_cut_throttle_below_atmosphere(self):
+        env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+        env.set_command(dict(target_ap=93_820, target_pe=70_463))
+        env.coast_throttle_cap = 0.02
+        for periapsis in (60_915, 68_000, 70_000):
+            with self.subTest(periapsis=periapsis):
+                throttle = env._compute_safe_throttle(
+                    raw_throttle=0, alt=80_814, ap=101_556, pe=periapsis, time_to_ap=30,
+                )
+                pitch = env._compute_safe_pitch(
+                    raw_pitch_fraction=1, alt=80_814, ap=101_556, pe=periapsis, time_to_ap=30,
+                )
+                self.assertEqual(throttle, 0.35)
+                self.assertEqual(pitch, 10)
+        self.assertEqual(env._compute_safe_throttle(
+            raw_throttle=1, alt=80_814, ap=101_556, pe=71_000, time_to_ap=30,
+        ), 0)
+        # Before the next burn window, a request may be capped for coasting,
+        # but is no longer unconditionally cut by the orbit-completion guard.
+        self.assertEqual(env._compute_safe_throttle(
+            raw_throttle=1, alt=80_814, ap=101_556, pe=60_915, time_to_ap=1401,
+        ), 0.02)
+
+    def test_reward_terms_account_for_complete_shaping_reward(self):
+        cases = (
+            dict(alt=500, vertical_speed=20, horizontal_speed=10, ap=10_000, pe=-500_000,
+                 pitch=90, throttle=1, time_to_ap=100),
+            dict(alt=30_000, vertical_speed=100, horizontal_speed=500, ap=90_000, pe=-300_000,
+                 pitch=70, throttle=0.7, time_to_ap=150),
+            dict(alt=80_000, vertical_speed=10, horizontal_speed=1500, ap=120_000, pe=40_000,
+                 pitch=10, throttle=0, time_to_ap=200),
+            dict(alt=100_000, vertical_speed=0, horizontal_speed=2100, ap=120_000, pe=95_000,
+                 pitch=5, throttle=0.5, time_to_ap=30),
+        )
+        for telemetry in cases:
+            with self.subTest(telemetry=telemetry):
+                env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+                env.set_command(dict(target_ap=120_000, target_pe=100_000))
+                env.prev_ap = 80_000
+                env.prev_pe = -350_000
+                env.prev_horizontal_speed = 400
+                env.current_step = 100
+                env._target_pitch_for_altitude = lambda altitude: 60
+                reward = env._compute_reward(**telemetry)
+                self.assertTrue(math.isfinite(reward))
+                self.assertAlmostEqual(sum(env._last_reward_terms.values()), reward)
+                self.assertAlmostEqual(env._last_reward_terms["time"], -0.006)
+
+    def test_reward_guidance_requires_safe_periapsis_for_low_target(self):
+        env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+        env.set_command(dict(target_ap=93_820, target_pe=70_463))
+        env.prev_ap = 101_556
+        env.prev_pe = 67_000
+        env.prev_horizontal_speed = 2000
+        env.current_step = 100
+        env._compute_reward(
+            alt=80_814, vertical_speed=0, horizontal_speed=2000,
+            ap=101_556, pe=68_000, pitch=5, throttle=0.35, time_to_ap=30,
+        )
+        self.assertAlmostEqual(env._last_reward_terms["coast_burn_guidance"], 0.008)
+
+    def test_apoapsis_progress_is_rewarded_without_a_remaining_distance_charge(self):
+        env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+        env.set_command(dict(target_ap=180_000, target_pe=100_000))
+        env.current_step = 100
+        env.prev_ap = 79_000
+        env.prev_pe = -350_000
+        env.prev_horizontal_speed = 500
+        env._target_pitch_for_altitude = lambda altitude: 60
+        telemetry = dict(
+            alt=30_000, vertical_speed=100, horizontal_speed=500, ap=80_000,
+            pe=-350_000, pitch=60, throttle=1, time_to_ap=150,
+        )
+        env._compute_reward(**telemetry)
+        self.assertEqual(env._last_reward_terms["apoapsis_deficit"], 0)
+        self.assertGreater(env._last_reward_terms["orbit_progress"], 0)
+        env._compute_reward(**{**telemetry, "ap": 78_000})
+        self.assertEqual(env._last_reward_terms["apoapsis_deficit"], 0)
+        self.assertLess(env._last_reward_terms["orbit_progress"], 0)
+
+    def test_waiting_in_coast_or_requesting_a_stalled_burn_does_not_earn_reward(self):
+        for time_to_ap, throttle in ((200, 0), (30, 0.5)):
+            with self.subTest(time_to_ap=time_to_ap, throttle=throttle):
+                env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+                env.set_command(dict(target_ap=120_000, target_pe=100_000))
+                env.current_step = 100
+                env.prev_ap = 120_000
+                env.prev_pe = 40_000
+                env.prev_horizontal_speed = 2000
+                telemetry = dict(
+                    alt=100_000, vertical_speed=0, horizontal_speed=2000, ap=120_000,
+                    pe=40_000, pitch=5, throttle=throttle, time_to_ap=time_to_ap,
+                )
+                env._compute_reward(**telemetry)  # Consume any one-time milestones.
+                reward = env._compute_reward(**telemetry)
+                self.assertEqual(env._last_reward_terms["milestones"], 0)
+                self.assertEqual(env._last_reward_terms["coast_burn_guidance"], 0)
+                self.assertAlmostEqual(reward, -0.006)
+
+    def test_burn_guidance_rewards_measured_periapsis_progress(self):
+        env = self.launch.KSPCommandedOrbitalEnv.__new__(self.launch.KSPCommandedOrbitalEnv)
+        env.set_command(dict(target_ap=120_000, target_pe=100_000))
+        env.current_step = 100
+        env.prev_ap = 120_000
+        env.prev_pe = 40_000
+        env.prev_horizontal_speed = 2000
+        env._compute_reward(
+            alt=100_000, vertical_speed=0, horizontal_speed=2000, ap=120_000,
+            pe=40_100, pitch=5, throttle=0.5, time_to_ap=30,
+        )
+        guidance = env._last_reward_terms["coast_burn_guidance"]
+        self.assertGreater(guidance, 0)
+        self.assertAlmostEqual(guidance, 0.0008)
+
+    def test_intervention_defaults_keep_cost_small_without_changing_guard_commands(self):
+        with patch.object(self.launch.krpc, "connect", create=True), \
+                patch.object(self.launch.np, "array", side_effect=lambda values, **kwargs: values, create=True), \
+                patch.object(self.launch.np, "float32", float, create=True), \
+                patch.object(self.launch.spaces, "Box", create=True), patch("builtins.print"):
+            env = self.launch.KSPCommandedOrbitalEnv()
+        self.assertEqual(env._compute_intervention_penalty(0, 0), 0)
+        self.assertAlmostEqual(env._compute_intervention_penalty(1, 1), 0.02)
+        self.assertEqual(env._compute_safe_throttle(
+            raw_throttle=0, alt=100, ap=100, pe=-500_000, time_to_ap=100,
+        ), 1)
+        self.assertEqual(env._compute_safe_pitch(raw_pitch_fraction=0, alt=100), 80)
+
+    def test_callback_logs_success_and_failure_returns_separately(self):
+        for success in (True, False):
+            with self.subTest(success=success):
+                callback = self.launch.KSPTrainingCallback.__new__(self.launch.KSPTrainingCallback)
+                callback.training_env = Mock()
+                callback.num_timesteps = 123
+                callback.logger = Mock()
+                callback.locals = {
+                    "dones": [True],
+                    "infos": [{
+                        "is_success": success, "episode_return": -12.5,
+                        "reward_terms": {"time": -0.006},
+                        "episode_reward_terms": {"time": -12.5},
+                    }],
+                }
+                with patch("builtins.print"):
+                    self.assertTrue(callback._on_step())
+                outcome = "success" if success else "failure"
+                callback.logger.record_mean.assert_any_call(f"episodes/{outcome}_return", -12.5)
+                callback.logger.record_mean.assert_any_call("reward_step/time", -0.006, exclude="stdout")
+                callback.logger.record_mean.assert_any_call("reward_episode/time", -12.5, exclude="stdout")
 
     def test_unsafe_periapsis_overrides_apoapsis_success(self):
         env = self.apoapsis.ApoapsisSpecialistEnv.__new__(self.apoapsis.ApoapsisSpecialistEnv)

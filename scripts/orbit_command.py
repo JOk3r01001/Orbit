@@ -14,6 +14,13 @@ else:
     from launch_command import validate_launch_command
 
 
+# Observation and action meanings are unchanged; existing policy weights remain
+# compatible. Separate logs and saved metadata identify the new reward objective.
+REWARD_REVISION = 2
+THROTTLE_INTERVENTION_PENALTY_SCALE = 0.01
+PITCH_INTERVENTION_PENALTY_SCALE = 0.01
+
+
 class KSPCommandedOrbitalEnv(gym.Env):
     """
     Goal-conditioned PPO environment for launching a multi-stage rocket
@@ -96,10 +103,10 @@ class KSPCommandedOrbitalEnv(gym.Env):
         # Maximum throttle during the coast phase
         self.coast_throttle_cap = 0.02
 
-        # Safety-intervention penalties are deliberately small so they
-        # guide PPO without dominating the mission reward.
-        self.throttle_intervention_penalty_scale = 0.10
-        self.pitch_intervention_penalty_scale = 0.10
+        # Intervention costs guide requests while keeping long flights from
+        # accumulating costs comparable to the full mission-completion bonus.
+        self.throttle_intervention_penalty_scale = THROTTLE_INTERVENTION_PENALTY_SCALE
+        self.pitch_intervention_penalty_scale = PITCH_INTERVENTION_PENALTY_SCALE
 
         # Curriculum boundaries. The callback updates training_timesteps.
         self.training_timesteps = 0
@@ -116,6 +123,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         # Episode state
         self.current_step = 0
+        self._episode_return = 0.0
+        self._episode_reward_terms = {}
+        self._last_reward_terms = {}
         self.last_stage_time = 0.0
         self.stage_count_start = 1
 
@@ -220,6 +230,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         # Reset episode counters
         self.current_step = 0
+        self._episode_return = 0.0
+        self._episode_reward_terms = {}
+        self._last_reward_terms = {}
         self.last_stage_time = time.time()
         self._reset_reward_milestones()
 
@@ -484,11 +497,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
             pitch_cmd - requested_pitch
         ) / 90.0
 
-        safety_intervention_penalty = (
-            self.throttle_intervention_penalty_scale
-            * throttle_intervention
-            + self.pitch_intervention_penalty_scale
-            * pitch_intervention
+        safety_intervention_penalty = self._compute_intervention_penalty(
+            throttle_intervention, pitch_intervention,
         )
 
         # Send commands to KSP
@@ -522,6 +532,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         time_to_ap = self._safe_time_to_apoapsis()
         fuel_fraction = self._current_fuel_fraction()
 
+        self._last_reward_terms = {}
         reward = self._compute_reward(
             alt=alt,
             vertical_speed=vertical_speed,
@@ -532,9 +543,12 @@ class KSPCommandedOrbitalEnv(gym.Env):
             throttle=throttle_cmd,
             time_to_ap=time_to_ap,
         )
+        reward_terms = dict(self._last_reward_terms) or {"shaping": reward}
 
         # PPO actions that need less safety correction are rewarded
         reward -= safety_intervention_penalty
+        reward_terms["safety_intervention"] = -safety_intervention_penalty
+        reward_before_terminal = reward
 
         ap_error = abs(
             ap - self.command_target_ap
@@ -780,6 +794,11 @@ class KSPCommandedOrbitalEnv(gym.Env):
         self.prev_pe = pe
         self.prev_horizontal_speed = horizontal_speed
 
+        reward_terms["terminal"] = reward - reward_before_terminal
+        self._episode_return += float(reward)
+        for name, value in reward_terms.items():
+            self._episode_reward_terms[name] = self._episode_reward_terms.get(name, 0.0) + float(value)
+
         info = {
             # Success metrics
             "is_success": success,
@@ -801,6 +820,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
             "pitch": pitch,
             "throttle": throttle_cmd,
             "fuel_fraction": fuel_fraction,
+            "reward_terms": reward_terms,
+            "reward_revision": REWARD_REVISION,
 
             # Safety-intervention metrics
             "raw_throttle": raw_throttle,
@@ -820,6 +841,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
         if terminated or truncated:
             self._episode_finished = True
             self.vessel.control.throttle = 0.0
+            info["episode_return"] = self._episode_return
+            info["episode_reward_terms"] = dict(self._episode_reward_terms)
 
         return (
             observation,
@@ -960,6 +983,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
         orbits. Repeated shaping terms are deliberately small and bounded.
         """
         reward = 0.0
+        terms = {}
 
         # --------------------------------------------------
         # 1. Command-normalized target progress
@@ -1012,26 +1036,13 @@ class KSPCommandedOrbitalEnv(gym.Env):
         )
 
         # --------------------------------------------------
-        # Apoapsis undershoot pressure
+        # Apoapsis undershoot is expected during a correct ascent. Closing the
+        # target error is rewarded below; time and regression already have costs.
+        # Keep this diagnostic key for comparison with revision 1.
         # --------------------------------------------------
 
-        ap_deficit = self.command_target_ap - ap
-
-        if (
-            alt >= 20_000.0
-            and ap_deficit > self.ap_tolerance
-        ):
-            ap_deficit_units = (
-                ap_deficit / self.ap_tolerance
-            )
-
-            reward -= 0.08 * float(
-                np.clip(
-                    ap_deficit_units,
-                    0.0,
-                    5.0,
-                )
-            )
+        terms["apoapsis_deficit"] = 0.0
+        previous_reward = reward
         
         if not ap_ready:
             reward += 2.5 * float(
@@ -1072,6 +1083,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
                     )
                 )
 
+        terms["orbit_progress"] = reward - previous_reward
+        previous_reward = reward
+
         # --------------------------------------------------
         # 2. Small bounded ascent guidance
         # --------------------------------------------------
@@ -1105,6 +1119,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
             reward -= 0.10 * normalized_pitch_error
 
+        terms["ascent_guidance"] = reward - previous_reward
+        previous_reward = reward
+
         # --------------------------------------------------
         # 3. Small horizontal progress only when useful
         # --------------------------------------------------
@@ -1125,6 +1142,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
                     1.0,
                 )
             )
+
+        terms["horizontal_progress"] = reward - previous_reward
+        previous_reward = reward
 
         # --------------------------------------------------
         # 4. Small bounded overshoot guidance
@@ -1155,6 +1175,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 1.0,
             )
         )
+
+        terms["overshoot"] = reward - previous_reward
+        previous_reward = reward
 
         # --------------------------------------------------
         # 5. One-time milestones with a modest common scale
@@ -1204,6 +1227,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
             reward += 30.0
             self.pe_near_target_awarded = True
 
+        terms["milestones"] = reward - previous_reward
+        previous_reward = reward
+
         # --------------------------------------------------
         # 6. Small coast and circularization guidance
         # --------------------------------------------------
@@ -1218,15 +1244,16 @@ class KSPCommandedOrbitalEnv(gym.Env):
 
         pe_still_low = (
             pe < self.command_target_pe - 5_000.0
+            or pe <= 70_000.0
         )
 
         if (
             ap_ready_for_coast
             and time_to_ap > 90.0
         ):
-            if throttle <= 0.05:
-                reward += 0.03
-            elif throttle > 0.20:
+            # Coasting can be necessary, but waiting alone must not generate
+            # a stream of positive reward, including during doomed episodes.
+            if throttle > 0.20:
                 reward -= 0.05
 
         if (
@@ -1235,8 +1262,9 @@ class KSPCommandedOrbitalEnv(gym.Env):
             and 0.0 < time_to_ap < 60.0
             and pe_still_low
         ):
+            burn_progress = float(np.clip(pe_progress, 0.0, 1.0))
             if pitch < 15.0:
-                reward += 0.05
+                reward += 0.05 * burn_progress
             else:
                 reward -= 0.05 * float(
                     np.clip(
@@ -1247,9 +1275,12 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 )
 
             if throttle > 0.30:
-                reward += 0.03
+                reward += 0.03 * burn_progress
             else:
                 reward -= 0.03
+
+        terms["coast_burn_guidance"] = reward - previous_reward
+        previous_reward = reward
 
         # --------------------------------------------------
         # 7. Small time and bad-behavior penalties
@@ -1259,6 +1290,8 @@ class KSPCommandedOrbitalEnv(gym.Env):
             0.002
             + 0.008 * self.command_urgency
         )
+        terms["time"] = reward - previous_reward
+        previous_reward = reward
 
         if (
             self.current_step > 30
@@ -1280,11 +1313,19 @@ class KSPCommandedOrbitalEnv(gym.Env):
         if alt > 1000.0 and vertical_speed < -50.0:
             reward -= 0.10
 
+        terms["flight_penalties"] = reward - previous_reward
+        self._last_reward_terms = terms
         return float(reward)
 
     # --------------------------------------------------
     # CONTROL HELPERS
     # --------------------------------------------------
+
+    def _compute_intervention_penalty(self, throttle_intervention, pitch_intervention):
+        return (
+            self.throttle_intervention_penalty_scale * throttle_intervention
+            + self.pitch_intervention_penalty_scale * pitch_intervention
+        )
 
     def _compute_safe_throttle(
         self,
@@ -1303,6 +1344,7 @@ class KSPCommandedOrbitalEnv(gym.Env):
             ap >= self.command_target_ap
             and pe
             >= self.command_target_pe - self.pe_tolerance
+            and pe > 70_000.0
         ):
             return 0.0
 
@@ -1336,8 +1378,10 @@ class KSPCommandedOrbitalEnv(gym.Env):
                 and ap
                 >= self.command_target_ap - 20_000.0
                 and 0.0 < time_to_ap < 60.0
-                and pe
-                < self.command_target_pe - 5_000.0
+                and (
+                    pe < self.command_target_pe - 5_000.0
+                    or pe <= 70_000.0
+                )
             ):
                 return max(
                     0.35,
@@ -1411,8 +1455,10 @@ class KSPCommandedOrbitalEnv(gym.Env):
             and ap
             >= self.command_target_ap - 20_000.0
             and 0.0 < time_to_ap < 60.0
-            and pe
-            < self.command_target_pe - 5_000.0
+            and (
+                pe < self.command_target_pe - 5_000.0
+                or pe <= 70_000.0
+            )
         ):
             return min(
                 safe_pitch,
@@ -1799,6 +1845,10 @@ class KSPTrainingCallback(BaseCallback):
         dones = self.locals.get("dones", [])
 
         for index, info in enumerate(infos):
+            if "reward_revision" in info:
+                self.logger.record("reward_config/revision", int(info["reward_revision"]))
+            for name, value in info.get("reward_terms", {}).items():
+                self.logger.record_mean(f"reward_step/{name}", float(value), exclude="stdout")
             ap_error_units = float(
                 info.get(
                     "normalized_apoapsis_error",
@@ -1870,6 +1920,11 @@ class KSPTrainingCallback(BaseCallback):
             )
 
             if episode_finished:
+                if "episode_return" in info:
+                    outcome = "success" if info.get("is_success", False) else "failure"
+                    self.logger.record_mean(f"episodes/{outcome}_return", float(info["episode_return"]))
+                for name, value in info.get("episode_reward_terms", {}).items():
+                    self.logger.record_mean(f"reward_episode/{name}", float(value), exclude="stdout")
                 actual_ap = float(
                     info.get("apoapsis", 0.0)
                 ) / 1000.0
@@ -1898,7 +1953,8 @@ class KSPTrainingCallback(BaseCallback):
                     f"Ap error: {ap_error_units:.2f} tolerances | "
                     f"Pe: {actual_pe:.1f}/{target_pe:.1f} km | "
                     f"Pe error: {pe_error_units:.2f} tolerances | "
-                    f"Fuel margin: {fuel_margin:+.3f}"
+                    f"Fuel margin: {fuel_margin:+.3f} | "
+                    f"Return: {info.get('episode_return', float('nan')):+.2f}"
                 )
 
                 self.logger.record(
@@ -2008,10 +2064,22 @@ if __name__ == "__main__":
 
     training_callback = KSPTrainingCallback()
 
+    # Custom model attributes are included in SB3's saved metadata. Loading an
+    # older policy keeps its weights and optimizer; this labels future saves.
+    model.reward_revision = REWARD_REVISION
+    model.reward_configuration = {
+        "apoapsis_deficit_penalty": 0.0,
+        "throttle_intervention_scale": env.throttle_intervention_penalty_scale,
+        "pitch_intervention_scale": env.pitch_intervention_penalty_scale,
+        "standing_coast_bonus": 0.0,
+        "burn_guidance": "positive_periapsis_progress",
+    }
+
     print(
         ">>> COMMENCING COMMANDED RL TRAINING. "
         "Press Ctrl+C to save and exit. <<<"
     )
+    print(f"Reward revision {REWARD_REVISION}; TensorBoard run: PPO_reward_v{REWARD_REVISION}")
 
     try:
         # Goal-conditioned training is harder than
@@ -2023,6 +2091,7 @@ if __name__ == "__main__":
                 training_callback,
             ],
             reset_num_timesteps=starting_fresh,
+            tb_log_name=f"PPO_reward_v{REWARD_REVISION}",
         )
 
         model.save(model_path)
