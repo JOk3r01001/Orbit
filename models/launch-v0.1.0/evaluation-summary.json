@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "release_tag": "launch-v0.1.0",
+  "evaluation_source": "User-provided scripts.test_orbit console summary",
+  "deterministic": true,
+  "same_vessel_and_starting_save": true,
+  "episodes": 6,
+  "successes": 6,
+  "success_rate": 1.0,
+  "mean_absolute_apoapsis_error_km": 4.0,
+  "mean_absolute_periapsis_error_km": 9.8,
+  "mean_fuel_fraction_margin": 0.102,
+  "apoapsis_tolerance_m": 10000,
+  "periapsis_tolerance_m": 10000,
+  "evaluated_model_sha256": null,
+  "checkpoint_identity_verified": false,
+  "release_model_sha256": "7cb832917fec31ece264bd733d7fbfe724888effd7dd5d3df24e871969f5ce85",
+  "flight_evaluation_repeated_during_packaging": false,
+  "commands": [
+    {"target_ap": 120000, "target_pe": 90000, "min_fuel_fraction": 0.02, "urgency": 0.5},
+    {"target_ap": 130000, "target_pe": 100000, "min_fuel_fraction": 0.02, "urgency": 0.5},
+    {"target_ap": 150000, "target_pe": 110000, "min_fuel_fraction": 0.015, "urgency": 0.5},
+    {"target_ap": 160000, "target_pe": 120000, "min_fuel_fraction": 0.015, "urgency": 0.5},
+    {"target_ap": 170000, "target_pe": 130000, "min_fuel_fraction": 0.01, "urgency": 0.5},
+    {"target_ap": 180000, "target_pe": 140000, "min_fuel_fraction": 0.01, "urgency": 0.5}
+  ],
+  "reported_final_case": {
+    "success": true,
+    "steps": 6172,
+    "total_reward": 397.28,
+    "apoapsis_km": 174.9,
+    "target_apoapsis_km": 180.0,
+    "periapsis_km": 130.1,
+    "target_periapsis_km": 140.0,
+    "fuel_fraction": 0.114,
+    "required_fuel_fraction": 0.01,
+    "fuel_fraction_margin": 0.104
+  },
+  "limitations": [
+    "Only six fixed orbit commands on one reference vessel and starting save",
+    "Original evaluation did not record a checkpoint hash",
+    "Latest saved checkpoint packaged without an additional live flight evaluation",
+    "Reference craft and KSP save are not included",
+    "No cross-vessel, randomized-condition, orbital-maneuver, or landing evaluation"
+  ]
+}

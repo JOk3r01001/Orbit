@@ -3,10 +3,11 @@
 Build a flight system that accepts a mission from a person or an AI commander,
 launches a rocket into orbit, changes that orbit, and lands using engine thrust.
 
-> **Model availability:** This repository currently contains training scripts and
-> supporting source code only; pretrained model weights are not included. Model
-> weights will be uploaded after the intended training goals have been achieved
-> and verified through evaluation.
+> **First model weights available:** The experimental launch PPO checkpoint is
+> available in [launch-v0.1.0](https://github.com/JOk3r01001/Orbit/releases/tag/launch-v0.1.0),
+> trained for **1,025,855 steps** with reward revision **2**. The release includes
+> the model, SHA-256 checksums, dependency versions, and a model card. Further
+> controller weights will be published as their training goals are achieved.
 
 The first vehicle profile is a single rocket on stock Kerbin, launching eastward
 into an 80–180 km apoapsis orbit. Powered landing will start with a throttleable
@@ -40,16 +41,52 @@ The commander chooses goals; the flight controllers choose flight actions.
 | --- | --- |
 | Structured mission commands | Implemented, with offline validation and examples |
 | Mission supervisor | Implemented coordination core with simulated test doubles; no live adapter yet |
-| Launch PPO environment | Existing kRPC environment, with command validation and terminal cutoff fixes; flight validation and retraining required |
+| Launch PPO environment | First experimental weights released; reported deterministic evaluation passed 6/6 reference-vessel missions |
 | Apoapsis PPO experiment | Raising-only specialist, consolidated into one implementation; not the planned orbital controller |
 | Orbital maneuver planner / PID | Planned |
 | Landing environment and PPO | Planned |
 | AI commander | Planned; a person can already write the same JSON command format |
 | Complete launch–maneuver–land mission | Planned |
 
-No trained policies, KSP craft files, or training saves are included. Offline
+Launch model weights are distributed as GitHub release assets, separately from
+the source tree. KSP craft files and training saves are not included. Offline
 tests do not measure flight performance. The supervisor does not yet run the
 legacy training environments or fly a vessel.
+
+## First launch model release
+
+Download [ppo_ksp_commanded_pilot_v4.zip](https://github.com/JOk3r01001/Orbit/releases/download/launch-v0.1.0/ppo_ksp_commanded_pilot_v4.zip)
+from the [first experimental launch release](https://github.com/JOk3r01001/Orbit/releases/tag/launch-v0.1.0).
+The [model card](models/launch-v0.1.0/model-card.md) describes the checkpoint,
+control interface, environment, limitations, and evaluation provenance.
+
+| Reported deterministic launch evaluation | Result |
+| --- | --- |
+| Fixed target-orbit cases | 6 |
+| Successful cases | 6/6 |
+| Mean absolute apoapsis error | 4.0 km |
+| Mean absolute periapsis error | 9.8 km |
+| Mean fuel-fraction margin above the requirement | +0.102 |
+
+These are user-reported results from `scripts/test_orbit.py` on one reference
+vessel and starting save, with 10 km orbital tolerances. They establish a working
+launch prototype, not general reliability across vessels or conditions. The
+original evaluation did not record a checkpoint hash; the released file is the
+latest saved checkpoint and was not separately flight-tested during packaging.
+
+After installing the training dependencies and preparing a compatible vessel,
+the `launchpad_ready` save, and a running kRPC 0.6.0 server, evaluate a downloaded
+checkpoint with:
+
+```powershell
+python -m scripts.test_orbit --model path\to\ppo_ksp_commanded_pilot_v4.zip
+```
+
+To resume training, place the downloaded model at the repository root with its
+original filename, preserving a backup of any existing model, then run
+`python -m scripts.orbit_command`. A compatible craft and save are required;
+changing the vessel may require evaluation and fine-tuning. Staging remains
+scripted. Orbital-maneuver and landing weights are not yet available.
 
 ## Try the commander interface without KSP
 
@@ -204,9 +241,10 @@ raises apoapsis; it does not implement arbitrary maneuvers or deorbit burns.
 1. **Commander and supervisor foundation:** strict commands, exclusive control,
    abort/failure handling, and offline regression tests. Implemented core;
    live integration remains.
-2. **Reliable launch:** install kRPC, validate resets and physics timing, add a
-   scripted baseline and a live launch adapter, retrain, then evaluate held-out
-   targets and starting conditions. Verify orbit and reserve with engines off.
+2. **Reliable launch:** first experimental checkpoint published after a reported
+   6/6 deterministic reference-vessel evaluation. Broader held-out evaluation,
+   physics-time stepping, a scripted baseline, and the live supervisor adapter
+   remain to be completed. Verify orbit and reserve with engines off.
 3. **Orbital maneuvers:** plan and execute apoapsis/periapsis changes, compare
    accuracy and propellant use with the PPO specialist, and add deorbit planning.
 4. **Powered landing:** begin with low-altitude vertical descents, then introduce
@@ -223,9 +261,11 @@ to each controller's results.
 
 ## Keep training recoverable
 
-Model `.zip` files and generated training outputs are intentionally ignored by
-Git. A source-code push does **not** back them up. Store selected checkpoints in
-an off-machine backup or an artifact release before reinstalling an OS.
+Local model `.zip` files and generated training outputs are intentionally ignored
+by Git. A source-code push does **not** back them up. Published checkpoints are
+uploaded separately as GitHub release assets; the first is
+[launch-v0.1.0](https://github.com/JOk3r01001/Orbit/releases/tag/launch-v0.1.0).
+Back up newer unpublished checkpoints off-machine before reinstalling an OS.
 
 Keep the checkpoint together with the Git commit, Python/package versions,
 training settings and seed, KSP/kRPC/mod versions, craft, training saves, and

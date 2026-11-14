@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "release_tag": "launch-v0.1.0",
+  "release_type": "experimental_prerelease",
+  "release_date": "2026-11-14",
+  "repository": "https://github.com/JOk3r01001/Orbit",
+  "source_implementation_commit": "b164bd5014f6a4e2682b80025ed9ca9c8f652646",
+  "model": {
+    "filename": "ppo_ksp_commanded_pilot_v4.zip",
+    "format": "stable_baselines3_ppo_zip",
+    "size_bytes": 161541,
+    "sha256": "7cb832917fec31ece264bd733d7fbfe724888effd7dd5d3df24e871969f5ce85",
+    "num_timesteps": 1025855,
+    "reward_revision": 2,
+    "reward_configuration": {
+      "apoapsis_deficit_penalty": 0.0,
+      "throttle_intervention_scale": 0.01,
+      "pitch_intervention_scale": 0.01,
+      "standing_coast_bonus": 0.0,
+      "burn_guidance": "positive_periapsis_progress"
+    },
+    "observation_shape": [
+      16
+    ],
+    "observation_dtype": "float32",
+    "action_shape": [
+      2
+    ],
+    "action_low": [
+      0.0,
+      0.0
+    ],
+    "action_high": [
+      1.0,
+      1.0
+    ],
+    "observation_normalization": "fixed in environment; no external VecNormalize file",
+    "device": "cpu",
+    "seed": null,
+    "hyperparameters": {
+      "learning_rate": 0.0003,
+      "n_steps": 1024,
+      "batch_size": 256,
+      "n_epochs": 10,
+      "gamma": 0.995,
+      "gae_lambda": 0.95,
+      "ent_coef": 0.01
+    }
+  },
+  "environment": {
+    "body": "Kerbin",
+    "heading_deg": 90,
+    "save_name": "launchpad_ready",
+    "staging": "scripted",
+    "attitude_control": "KSP autopilot",
+    "krpc_version": "0.6.0",
+    "apoapsis_tolerance_m": 10000,
+    "periapsis_tolerance_m": 10000,
+    "max_episode_steps": 9000,
+    "step_sleep_s": 0.1,
+    "craft_included": false,
+    "training_save_included": false
+  },
+  "recorded_training_system_info": [
+    "- OS: Windows-11-10.0.26200-SP0 10.0.26200",
+    "- Python: 3.12.10",
+    "- Stable-Baselines3: 2.9.2",
+    "- PyTorch: 2.15.0+cpu",
+    "- GPU Enabled: False",
+    "- Numpy: 2.5.4",
+    "- Cloudpickle: 3.1.2",
+    "- Gymnasium: 1.4.0"
+  ],
+  "packaging_environment_distributions": {
+    "Farama-Notifications": "0.0.6",
+    "Jinja2": "3.1.6",
+    "Markdown": "3.11.3",
+    "MarkupSafe": "3.0.4",
+    "Werkzeug": "3.1.9",
+    "absl-py": "2.5.1",
+    "cloudpickle": "3.1.2",
+    "filelock": "4.2.9",
+    "fsspec": "2026.9.0",
+    "grpcio": "1.85.1",
+    "gymnasium": "1.4.0",
+    "krpc": "0.6.0",
+    "mpmath": "1.3.0",
+    "networkx": "3.7",
+    "numpy": "2.5.4",
+    "packaging": "26.3",
+    "pillow": "13.0.0",
+    "pip": "25.0.1",
+    "protobuf": "7.36.2",
+    "setuptools": "84.2.1",
+    "stable_baselines3": "2.9.2",
+    "sympy": "1.14.0",
+    "tensorboard": "2.21.0",
+    "tensorboard-data-server": "0.7.2",
+    "torch": "2.15.0",
+    "typing_extensions": "4.16.0"
+  },
+  "reported_evaluation": {
+    "file": "evaluation-summary.json",
+    "episodes": 6,
+    "successes": 6,
+    "checkpoint_identity_verified": false,
+    "note": "The user-provided evaluation report did not capture a checkpoint hash; no live flights were repeated during packaging."
+  },
+  "packaging_validation": {
+    "zip_integrity": "passed",
+    "ppo_deserialization": "passed",
+    "observation_and_action_shapes": "passed",
+    "finite_deterministic_prediction": "passed",
+    "ksp_connection_used": false
+  }
+}
