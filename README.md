@@ -40,18 +40,18 @@ The commander chooses goals; the flight controllers choose flight actions.
 | Component | Current state |
 | --- | --- |
 | Structured mission commands | Implemented, with offline validation and examples |
-| Mission supervisor | Implemented coordination core with simulated test doubles; no live adapter yet |
+| Mission supervisor | Coordination core plus live orbital adapter; launch/landing adapters remain pending |
 | Launch PPO environment | First experimental weights released; reported deterministic evaluation passed 6/6 reference-vessel missions |
 | Apoapsis PPO experiment | Raising-only specialist, consolidated into one implementation; not the planned orbital controller |
-| Orbital maneuver planner / PID | Planned |
-| Landing environment and PPO | Planned |
+| Orbital maneuver planner / PID | Prototype implemented; offline finite-burn tests passed; first user-reported live 102 x 81 km to 150 x 120 km maneuver succeeded within 1 km tolerances |
+| Landing environment and PPO | Initial throttle-only descent training runner implemented; prepared save and live validation pending; no landing weights yet |
 | AI commander | Planned; a person can already write the same JSON command format |
 | Complete launch–maneuver–land mission | Planned |
 
 Launch model weights are distributed as GitHub release assets, separately from
 the source tree. KSP craft files and training saves are not included. Offline
-tests do not measure flight performance. The supervisor does not yet run the
-legacy training environments or fly a vessel.
+tests do not measure KSP flight performance. The supervisor can run orbital
+maneuvers through the new adapter; launch training remains a separate runner.
 
 ## First launch model release
 
@@ -219,6 +219,94 @@ Tighter orbit tolerances can be requested, but the existing training curriculum
 uses 10 km tolerances. A policy's accuracy must be measured before claiming it
 can satisfy tighter requests.
 
+### Phase 2: orbital maneuvers with planning and PID
+
+`scripts/orbit_maneuver.py` changes the **current vessel's** apoapsis/periapsis
+in Kerbin orbit. It uses a two-body burn planner, PID throttle control, KSP
+autopilot, and the mission supervisor. No new PPO weights or training are needed.
+It never reloads a save or automatically starts another episode.
+
+First inspect a plan offline, without KSP:
+
+```powershell
+python -m scripts.orbit_maneuver --snapshot examples/telemetry/orbit_snapshot.json
+```
+
+For live use, stop other flight-control scripts, leave the vessel in a stable
+Kerbin orbit, keep a usable LiquidFuel engine active with throttle at zero, and
+set time warp to normal speed. The reference craft/save and adequate propellant
+are still required. The controller does not activate engines or stage.
+
+Preview the plan from live telemetry; this command only reads KSP:
+
+```powershell
+python -m scripts.orbit_maneuver --mission examples/change_orbit.json
+```
+
+After reviewing that plan, execute the task with:
+
+```powershell
+python -m scripts.orbit_maneuver --mission examples/change_orbit.json --execute
+```
+
+The example requests **150 x 120 km**, with **1 km** apoapsis/periapsis
+tolerances, a 3-second engine-off settling interval, and a 7,200-second simulation
+timeout. Targets retain the first profile's 80–180 km apoapsis envelope; orbital
+maneuvers additionally require a requested periapsis of at least 71 km.
+
+Burns occur at the opposite apsis: apoapsis changes at periapsis, and periapsis
+changes at apoapsis. Prograde raises orbital energy and retrograde lowers it.
+The planner chooses a valid sequence when lowering both apsides below the old
+periapsis, estimates delta-v and burn duration, then the live controller replans
+from measured telemetry after each burn. Near-circular goals use compatible
+intermediate tolerances to avoid asking an apsis to cross its fixed counterpart.
+
+The runner may coast for many minutes waiting for an apsis. It does not time warp.
+PID control uses simulation-time intervals and blocks thrust until aligned.
+Long burns exceeding the small-impulse profile, missed windows, unusable engines,
+unsafe periapsis, reserve violations, paused/rewound simulation time, excessive
+telemetry gaps, and task timeout cause failure and a cutoff request. Ctrl+C
+aborts and requests cutoff. Reports and JSONL telemetry are written under
+`training_output/maneuvers/`.
+
+The fuel fraction for this standalone phase is relative to the LiquidFuel
+present when the orbital adapter connects. It is not the original launch fuel
+fraction and does not prove sufficient delta-v. Integrated whole-mission fuel
+budgeting remains future work. Inclination changes, transfers, deorbit, orbital
+staging, and automatic launch-to-maneuver handoff are not implemented.
+
+Offline checks include independent energy/angular-momentum verification of
+impulse plans, PID anti-windup, transport deadlines, cleanup, and finite-thrust
+raise/lower simulations. A live read-only plan was also verified. KSP burn
+accuracy and the PID gains still require live validation; passing offline tests
+does not establish 1 km accuracy in KSP.
+
+See [the orbital controller design](docs/orbital-maneuvers.md) for limitations,
+timing behavior, and the first live test procedure.
+
+### Phase 3: vertical powered-landing PPO
+
+The first landing curriculum learns throttle while autopilot holds the rocket
+upright. Prepare a separate **`landing_training_start`** save during descent,
+preferably 300-500 m above flat dry ground at 10-20 m/s downward, with horizontal
+speed below 0.5 m/s. Keep a throttleable engine active, throttle zero, landing
+legs deployed and parachutes stowed. Available thrust/weight must be at least
+1.3. This save is reloaded every episode; the orbital save cannot be used here.
+
+```powershell
+python -m scripts.landing_train check
+python -m scripts.landing_train train
+```
+
+The check actively controls the vessel with random actions. Training starts a
+new landing policy or resumes `training_output/landing_v1/landing_latest.zip`.
+Periodic checkpoints are saved every 5,000 steps, and Ctrl+C saves current
+parameters. Keep each checkpoint's matching JSON metadata for resume. This
+curriculum has no lateral steering, deorbit or automatic orbital handoff yet.
+KSP landing performance is unverified until the first descent-save test.
+
+See [landing preparation, rewards, evaluation and resume instructions](docs/landing-training.md).
+
 ### Legacy apoapsis specialist
 
 Prepare `orbit_training_start` in a stable Kerbin orbit with a usable engine and
@@ -245,8 +333,9 @@ raises apoapsis; it does not implement arbitrary maneuvers or deorbit burns.
    6/6 deterministic reference-vessel evaluation. Broader held-out evaluation,
    physics-time stepping, a scripted baseline, and the live supervisor adapter
    remain to be completed. Verify orbit and reserve with engines off.
-3. **Orbital maneuvers:** plan and execute apoapsis/periapsis changes, compare
-   accuracy and propellant use with the PPO specialist, and add deorbit planning.
+3. **Orbital maneuvers:** planner/PID prototype and live runner implemented.
+   Validate live burns, measure accuracy and propellant use, connect the launch
+   handoff, then add deorbit planning.
 4. **Powered landing:** begin with low-altitude vertical descents, then introduce
    horizontal velocity, target location, mass, and thrust variation. Train on
    states produced by the preceding controller before connecting the stages.
@@ -286,6 +375,8 @@ the interrupted simulator trajectory is not guaranteed.
 - `examples/`: mission JSON for each planned control stage.
 - `scripts/orbit_command.py`: existing launch training environment and PPO runner.
 - `scripts/test_orbit.py`: deterministic launch evaluation.
+- `scripts/orbit_maneuver.py`: read-only orbital plans and explicit live execution.
+- `scripts/landing_train.py`: initial vertical landing PPO checks, training and evaluation.
 - `scripts/apoapsis_brain.py`: canonical legacy apoapsis experiment.
 - `tests/`: offline contract, supervisor, and training regression tests.
 - `data_train/`: existing flight recordings; not PPO checkpoints and not consumed

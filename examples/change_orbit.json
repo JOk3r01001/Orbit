@@ -8,5 +8,5 @@
     "periapsis_tolerance_m": 1000
   },
   "minimum_fuel_fraction": 0.02,
-  "timeout_s": 3600
+  "timeout_s": 7200
 }

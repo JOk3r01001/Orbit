@@ -1,0 +1,26 @@
+{
+  "ut_s": 100000,
+  "vessel_id": "offline-reference-vessel",
+  "body": "Kerbin",
+  "situation": "orbiting",
+  "altitude_m": 140000,
+  "altitude_agl_m": 140000,
+  "apoapsis_m": 175000,
+  "periapsis_m": 130000,
+  "vertical_speed_mps": 0,
+  "horizontal_speed_mps": 2100,
+  "tilt_deg": 90,
+  "fuel_fraction": 1,
+  "latitude_deg": 0,
+  "longitude_deg": 0,
+  "orbital": {
+    "body_radius_m": 600000,
+    "gravitational_parameter": 3531600000000,
+    "time_to_apoapsis_s": 600,
+    "time_to_periapsis_s": 1600,
+    "mass_kg": 5000,
+    "available_thrust_n": 200000,
+    "specific_impulse_s": 320,
+    "prograde_alignment": 1
+  }
+}

@@ -1,7 +1,7 @@
 """Coordinate one controller per vessel; never load a training save.
 
 Concrete controllers compute commands. Only the supervisor calls the actuator.
-No KSP adapter or trained policy is bundled with this foundation.
+The orbital kRPC adapter is implemented separately in krpc_adapter.py.
 """
 
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Protocol
 
 from .commands import LandingTarget, MissionTask, OrbitTarget, TaskType, number
+from .orbits import OrbitalTelemetry
 
 
 class Status(str, Enum):
@@ -38,6 +39,7 @@ class FlightState:
     intact: bool = True
     touchdown_vertical_speed_mps: float | None = None
     touchdown_horizontal_speed_mps: float | None = None
+    orbital: OrbitalTelemetry | None = None
 
     def __post_init__(self) -> None:
         number(self.ut_s, "ut_s", 0, 1e15)
@@ -52,6 +54,8 @@ class FlightState:
             raise ValueError("vessel_id must be a nonempty string")
         if type(self.intact) is not bool:
             raise ValueError("intact must be boolean")
+        if self.orbital is not None and not isinstance(self.orbital, OrbitalTelemetry):
+            raise ValueError("orbital must be OrbitalTelemetry")
         for name in ("touchdown_vertical_speed_mps", "touchdown_horizontal_speed_mps"):
             value = getattr(self, name)
             if value is not None:
@@ -64,6 +68,7 @@ class ControlCommand:
     pitch_deg: float | None = None
     heading_deg: float | None = None
     stage: bool = False
+    attitude: str | None = None
 
     def __post_init__(self) -> None:
         number(self.throttle, "throttle", 0, 1)
@@ -74,6 +79,10 @@ class ControlCommand:
             number(self.heading_deg, "heading_deg", 0, 360)
         if type(self.stage) is not bool:
             raise ValueError("stage must be boolean")
+        if self.attitude not in {None, "orbital_prograde", "orbital_retrograde"}:
+            raise ValueError("Unsupported attitude mode")
+        if self.attitude is not None and self.pitch_deg is not None:
+            raise ValueError("Choose either orbital attitude or pitch/heading")
 
 
 class Controller(Protocol):
@@ -209,6 +218,13 @@ class MissionSupervisor:
         if self.status != Status.RUNNING:
             raise ValueError("No mission is running")
         self._finish(Status.ABORTED, "Aborted by commander")
+        return self.report()
+
+    def fail(self, reason: str) -> dict:
+        """Let a live runner report transport/telemetry failure and release controls."""
+        if self.status != Status.RUNNING:
+            raise ValueError("No mission is running")
+        self._finish(Status.FAILED, reason)
         return self.report()
 
     def _finish(self, status: Status, reason: str) -> None:

@@ -32,9 +32,9 @@ reported vessel identity and body; a change causes failure and a stop request.
 Only `Actuator.apply()` and `Actuator.stop()` own physical control. A controller's
 `start(task, state)` initializes its internal state; `update(state)` returns a
 validated `ControlCommand`. Controllers must not call kRPC directly. Staging is
-permitted only for the launch task. The eventual actuator must verify that its
-bound vessel is still the intended vessel, rather than applying commands to
-whatever vessel happens to be active.
+permitted only for the launch task. The orbital actuator checks its bound remote
+vessel object before commands and refuses commands after an active-vessel or
+sphere-of-influence change. The first orbital profile never stages.
 
 Controller exceptions, actuator errors, reserve violations, mission timeout,
 vessel destruction, and non-advancing simulation timestamps end the task. Every
@@ -53,20 +53,25 @@ the core cannot guarantee hardware state after a lost kRPC connection.
 - Fuel fraction relative to the task's defined starting load.
 - Latitude, longitude, and vessel integrity.
 - Recorded vertical/horizontal speeds at touchdown, when known.
+- Optional `OrbitalTelemetry`: body radius/gravity parameter, times to apsides,
+  current mass, available thrust, specific impulse, and prograde alignment.
 
-The future kRPC adapter must provide a consistent sample and correct reference
-frames. Orbital velocity is measured in a body-centered non-rotating frame;
-surface landing velocity is measured relative to the rotating body. The adapter
-must record touchdown speeds at contact and retain them during settling; zero
-velocity after a hard impact is not evidence of a safe landing. Missing contact
-speed data prevents landing success.
+The orbital kRPC adapter samples the bound vessel using the correct reference
+frames. Orbital velocity and alignment use a body-centered non-rotating frame;
+surface velocities use the rotating body frame, and tilt uses a local surface
+frame. Samples are sequential RPC reads, not atomic physics-tick snapshots.
+The future landing adapter must record touchdown speeds at contact and retain
+them during settling; zero velocity after a hard impact is not evidence of a
+safe landing. Missing contact-speed data prevents landing success.
 
-Mission timeouts use simulation time. The current supervisor consumes samples
-supplied by a caller; it has no polling loop, maximum sample-gap check, or
-wall-clock connection watchdog. Those belong in the live runner. Stable-goal
-checks assume regular telemetry; offline tests do not establish stability
-between observations. The legacy training scripts still use wall-clock sleeps,
-so physics-time stepping remains an integration milestone.
+Mission timeouts use simulation time. The supervisor consumes samples supplied
+by a caller. The orbital runner rejects gaps greater than two simulation seconds
+and fails after three wall-clock seconds without advancing simulation time.
+After connection setup, RPC response reads have deadlines, including the kRPC
+0.6 size-prefix polling path. Initial service discovery still uses the SDK's
+handshake. If the server is unreachable, a cutoff request cannot be guaranteed.
+Stable-goal checks assume regular telemetry. The legacy launch training script
+still uses wall-clock sleeps; its physics-time stepping remains future work.
 
 ## Completion and handoffs
 
@@ -84,8 +89,9 @@ it leaves tolerance, restart settling and return control to the current
 controller. A successful handoff releases controller-owned inputs via `stop()`.
 
 `report()` returns task identity, status, reason, and elapsed simulation time.
-Persisted telemetry, metrics, and mission event logs will be added with the live
-runner.
+The orbital runner persists JSONL telemetry and a final JSON report under
+`training_output/maneuvers/`. Its standalone fuel fraction is measured against
+the load at connection time, not the initial launch load.
 
 ## Integration boundary
 
@@ -94,7 +100,9 @@ rewards, stages, and writes to kRPC itself. Its `set_command()` method is useful
 for updating a goal without a save reload, but it is not a supervisor controller
 implementation. Extract policy observation/action conversion and scripted guards
 into a live controller, then add a single kRPC actuator and telemetry adapter.
-Never give the legacy environment and supervisor concurrent control.
+Never give the legacy environment and supervisor concurrent control. The new
+orbital controller already uses the supervisor and a single kRPC actuator;
+automatic launch-to-orbit-controller handoff remains to be implemented.
 
 The launch policy's current observation has 16 values. Changes to its shape,
 ordering, normalization, action meaning, or scripted guard behavior require a
