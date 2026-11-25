@@ -33,6 +33,22 @@ class TelemetryClock:
 
 def return_plan(mission, state):
     result = plan_report(mission.deorbit, state)
+    orbital = state.orbital
+    gravity = orbital.gravitational_parameter / (orbital.body_radius_m + state.altitude_m) ** 2
+    surface_gravity = orbital.gravitational_parameter / orbital.body_radius_m ** 2
+    acceleration = orbital.available_thrust_n / orbital.mass_kg
+    result["engine_preflight"] = {
+        "mass_kg": orbital.mass_kg,
+        "available_thrust_n": orbital.available_thrust_n,
+        "available_acceleration_mps2": acceleration,
+        "current_gravity_mps2": gravity,
+        "current_thrust_weight": acceleration / gravity,
+        "surface_thrust_weight_estimate": acceleration / surface_gravity,
+        "minimum_current_thrust_weight": mission.profile.min_thrust_weight,
+        "current_thrust_weight_ok": acceleration / gravity >= mission.profile.min_thrust_weight,
+        "note": "Available thrust is at full throttle with the current active-engine configuration. "
+                "Throttle zero is allowed. Surface estimate uses current mass/thrust and ignores engine pressure changes.",
+    }
     result["return_mission"] = mission.to_dict()
     result["note"] += (" Periapsis is a trajectory target, not a handoff trigger or landing-site prediction."
                        " No atmospheric, heating, terrain, or propellant-feasibility prediction is made.")
@@ -56,8 +72,24 @@ def run_return(mission, adapter, descent, model=None, capture_save=None, log_dir
         descent.initial_fuel = adapter.initial_fuel
         descent.initial_parts = len(adapter.vessel.parts.all)
         initial = descent.read()
-        if not initial.intact or initial.acceleration_mps2 < mission.profile.min_thrust_weight * initial.gravity_mps2:
-            raise ValueError("Return preflight requires an intact craft and sufficient active-engine thrust/weight")
+        thrust_weight = initial.acceleration_mps2 / initial.gravity_mps2
+        report["preflight"] = {
+            "sample": asdict(initial), "thrust_weight": thrust_weight,
+            "minimum_thrust_weight": mission.profile.min_thrust_weight,
+        }
+        print(f"Return preflight | TWR {thrust_weight:.3f} / required {mission.profile.min_thrust_weight:.3f} "
+              f"| available acceleration {initial.acceleration_mps2:.3f} m/s^2 "
+              f"| gravity {initial.gravity_mps2:.3f} m/s^2 | intact {initial.intact}", flush=True)
+        if not initial.intact:
+            raise ValueError("Return preflight failed: vessel parts were lost during telemetry sampling")
+        if thrust_weight < mission.profile.min_thrust_weight:
+            raise ValueError(
+                f"Return preflight failed: available thrust/weight {thrust_weight:.3f} "
+                f"is below the configured minimum {mission.profile.min_thrust_weight:.3f}. "
+                "Check that the intended landing engine is active, fueled, and its thrust limiter is correct. "
+                "If thrust is already fully available, use a lighter craft or more landing thrust; "
+                "PPO training cannot add engine thrust. Throttle may remain at zero."
+            )
         if any(chute.deployed for chute in adapter.vessel.parts.parachutes):
             raise ValueError("Stow/remove parachutes before a powered return")
         report["deorbit"] = run_live(mission.deorbit, adapter, log_dir=log_dir)

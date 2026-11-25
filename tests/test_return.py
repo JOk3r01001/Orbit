@@ -201,8 +201,21 @@ class ReturnRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch("scripts.return_to_ground.run_live") as deorbit:
             report = run_return(mission(), adapter, descent, model=Mock(), log_dir=Path(directory))
         self.assertEqual(report["status"], "failed")
+        self.assertAlmostEqual(report["preflight"]["thrust_weight"], 5 / 9.81)
+        self.assertIn("0.510", report["reason"])
+        self.assertIn("minimum 1.300", report["reason"])
         deorbit.assert_not_called()
         adapter.stop.assert_called()
+
+    def test_preview_reports_available_thrust_and_mass_without_actuation(self):
+        state = flight()
+        result = return_plan(mission(), state)
+        engine = result["engine_preflight"]
+        self.assertEqual(engine["mass_kg"], 5000)
+        self.assertEqual(engine["available_thrust_n"], 200_000)
+        self.assertAlmostEqual(engine["available_acceleration_mps2"], 40)
+        self.assertAlmostEqual(engine["surface_thrust_weight_estimate"], 40 / (3.5316e12 / 600_000 ** 2))
+        self.assertTrue(engine["current_thrust_weight_ok"])
 
     def test_surface_retrograde_uses_rotating_body_velocity(self):
         body = SimpleNamespace(reference_frame=object())

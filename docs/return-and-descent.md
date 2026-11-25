@@ -79,6 +79,15 @@ Read-only preview (no engine/autopilot writes):
 python -m scripts.return_to_ground
 ```
 
+The preview's `engine_preflight` section shows active-engine available thrust,
+mass, current thrust/weight and a surface estimate. The current preflight minimum
+is 1.3. Zero throttle is allowed: available thrust describes full-throttle
+capability, not the thrust being fired now. If this check fails, verify the
+intended engine is active, fueled and not thrust-limited; an underpowered craft
+needs less mass or more thrust. Live failures retain the sampled TWR and limit
+in the return report. The surface estimate ignores pressure-dependent thrust
+changes and fuel consumption, so it is only diagnostic.
+
 Offline preview without KSP or flight dependencies:
 
 ```powershell
