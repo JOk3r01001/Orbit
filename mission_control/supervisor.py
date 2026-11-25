@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from .commands import LandingTarget, MissionTask, OrbitTarget, TaskType, number
+from .commands import DeorbitTarget, LandingTarget, MissionTask, OrbitTarget, TaskType, number
 from .orbits import OrbitalTelemetry
 
 
@@ -79,7 +79,7 @@ class ControlCommand:
             number(self.heading_deg, "heading_deg", 0, 360)
         if type(self.stage) is not bool:
             raise ValueError("stage must be boolean")
-        if self.attitude not in {None, "orbital_prograde", "orbital_retrograde"}:
+        if self.attitude not in {None, "orbital_prograde", "orbital_retrograde", "surface_retrograde"}:
             raise ValueError("Unsupported attitude mode")
         if self.attitude is not None and self.pitch_deg is not None:
             raise ValueError("Choose either orbital attitude or pitch/heading")
@@ -124,16 +124,16 @@ class MissionSupervisor:
             raise ValueError("The vessel already has less than the requested fuel reserve")
         if task.task == TaskType.REACH_ORBIT and state.situation not in {"pre_launch", "landed"}:
             raise ValueError("reach_orbit starts on the launchpad; use change_orbit in orbit")
-        if task.task == TaskType.CHANGE_ORBIT and not (
+        if task.task in {TaskType.CHANGE_ORBIT, TaskType.DEORBIT} and not (
             state.situation == "orbiting" and state.periapsis_m > 70_000
         ):
-            raise ValueError("change_orbit requires a stable Kerbin orbit above the atmosphere")
+            raise ValueError("Orbital/deorbit tasks require a stable Kerbin orbit above the atmosphere")
         if task.task == TaskType.LAND and not (
             state.situation in {"flying", "sub_orbital"}
             and 0 <= state.altitude_agl_m <= 10_000
             and state.vertical_speed_mps <= 0
         ):
-            raise ValueError("land requires descent below 10 km AGL; deorbit is a separate future capability")
+            raise ValueError("This supervisor's land adapter requires descent below 10 km AGL")
         self.task = task
         self._controller = self.controllers[task.task]
         self._vessel_id = state.vessel_id
@@ -189,6 +189,9 @@ class MissionSupervisor:
     def _goal_reached(self, state: FlightState) -> bool:
         assert self.task is not None
         target = self.task.target
+        if isinstance(target, DeorbitTarget):
+            return (state.altitude_m > 70_000 and state.periapsis_m > 0
+                    and abs(state.periapsis_m - target.periapsis_m) <= target.periapsis_tolerance_m)
         if isinstance(target, OrbitTarget):
             return (
                 state.altitude_m > 70_000 and state.periapsis_m > 70_000

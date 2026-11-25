@@ -151,8 +151,16 @@ class KRPCOrbitalAdapter:
         if command.stage:
             raise ValueError("The orbital actuator never stages")
         if command.attitude is not None:
-            frame = self.body.non_rotating_reference_frame
-            velocity = self.vessel.velocity(frame)
+            frame = (self.vessel.surface_reference_frame if command.attitude == "surface_retrograde"
+                     else self.body.non_rotating_reference_frame)
+            if command.attitude == "surface_retrograde":
+                # The local frame's origin moves with the vessel. Rotate a
+                # BODY-frame surface velocity, rather than measuring velocity
+                # relative to that moving origin (which would be zero).
+                surface_velocity = self.vessel.velocity(self.body.reference_frame)
+                velocity = self.space_center.transform_direction(surface_velocity, self.body.reference_frame, frame)
+            else:
+                velocity = self.vessel.velocity(frame)
             norm = math.sqrt(sum(value * value for value in velocity))
             if norm <= 0:
                 raise ValueError("Cannot orient without orbital velocity")

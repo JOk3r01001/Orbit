@@ -88,6 +88,49 @@ class LandingEnv(gym.Env):
             distance_to_target(s, t) / t.radius_m, t.max_tilt_deg / 30,
         ], dtype=np.float32)
 
+    def validate_initial(self, sample):
+        if not (100 <= sample.height_m <= 1000 and -40 <= sample.vertical_mps < 0
+                and sample.horizontal_mps <= .5 and sample.tilt_deg <= 10
+                and sample.situation in {"flying", "sub_orbital"}):
+            raise ValueError("Save must be descending at 100-1000 m AGL, -40..0 m/s vertical, <=0.5 m/s horizontal, <=10 degrees tilt")
+        if sample.acceleration_mps2 < 1.3 * sample.gravity_mps2:
+            raise ValueError("Keep a throttleable landing engine active with thrust/weight >=1.3")
+        stopping_distance = sample.vertical_mps ** 2 / (2 * (sample.acceleration_mps2 - sample.gravity_mps2))
+        if stopping_distance > .6 * sample.height_m:
+            raise ValueError("Descent save is too fast/low for the initial curriculum")
+
+    def default_target(self, sample):
+        return LandingTarget(sample.latitude_deg, sample.longitude_deg)
+
+    def validate_target(self, sample):
+        if distance_to_target(sample, self.target) > self.target.radius_m:
+            raise ValueError("Throttle-only stage cannot steer to a distant landing site")
+
+    def configure_attitude(self):
+        ap = self.vessel.auto_pilot
+        ap.reference_frame = self.vessel.surface_reference_frame
+        ap.target_pitch_and_heading(90, 90)
+        ap.engaged = True
+
+    def apply_policy_action(self, action):
+        action = np.asarray(action, dtype=float)
+        if action.shape != (1,) or not np.isfinite(action).all():
+            raise ValueError("Expected one finite throttle action")
+        self.throttle = 0 if self.contact is not None or self.previous.tilt_deg > 15 else float(np.clip(action[0], 0, 1))
+        self.vessel.control.throttle = self.throttle
+
+    def outside_envelope(self, sample):
+        return sample.height_m > 1500 or sample.vertical_mps > 20 or sample.tilt_deg > 45
+
+    def reward_transition(self, previous, sample):
+        return transition_reward(previous, sample, self.target)
+
+    def alignment_intervention(self):
+        return self.previous.tilt_deg > 15
+
+    episode_timeout_s = 180
+    maximum_steps = 3000
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         if options:
@@ -97,44 +140,44 @@ class LandingEnv(gym.Env):
             self.vessel = None  # A loaded save invalidates remote vessel references.
             self.sc.load(self.save_name)
             time.sleep(2)
+            return self.begin_current()
+        except BaseException:
+            self.done = True
+            self.stop()
+            raise
+
+    def begin_current(self, expected_vessel=None, fuel_reference=None):
+        """Initialize on the current vessel without reloading; used at handoff."""
+        try:
+            if expected_vessel is not None and self.sc.active_vessel != expected_vessel:
+                raise RuntimeError("Active vessel changed before landing handoff")
             self.vessel = self.sc.active_vessel
             self.vessel.control.throttle = 0
             self.body = self.vessel.orbit.body
             if self.body.name != "Kerbin":
                 raise ValueError("Landing stage one supports Kerbin only")
-            self.initial_fuel = float(self.vessel.resources.amount("LiquidFuel"))
+            self.initial_fuel = (float(self.vessel.resources.amount("LiquidFuel"))
+                                 if fuel_reference is None else fuel_reference)
             self.initial_parts = len(self.vessel.parts.all)
             if self.initial_fuel <= 0:
                 raise ValueError("A LiquidFuel engine is required")
             sample = self.read()
-            if not (100 <= sample.height_m <= 1000 and -40 <= sample.vertical_mps < 0
-                    and sample.horizontal_mps <= .5 and sample.tilt_deg <= 10
-                    and sample.situation in {"flying", "sub_orbital"}):
-                raise ValueError("Save must be descending at 100-1000 m AGL, -40..0 m/s vertical, <=0.5 m/s horizontal, <=10 degrees tilt")
-            if sample.acceleration_mps2 < 1.3 * sample.gravity_mps2:
-                raise ValueError("Keep a throttleable landing engine active with thrust/weight >=1.3")
-            stopping_distance = sample.vertical_mps ** 2 / (2 * (sample.acceleration_mps2 - sample.gravity_mps2))
-            if stopping_distance > .6 * sample.height_m:
-                raise ValueError("Descent save is too fast/low for the initial curriculum")
+            self.validate_initial(sample)
             if any(chute.deployed for chute in self.vessel.parts.parachutes):
                 raise ValueError("Retract/remove parachutes for powered-landing training")
-            self.target = self.task.target if self.task else LandingTarget(sample.latitude_deg, sample.longitude_deg)
-            if distance_to_target(sample, self.target) > self.target.radius_m:
-                raise ValueError("Throttle-only stage cannot steer to a distant landing site")
-            self.timeout = min(180, self.task.timeout_s) if self.task else 180
+            self.target = self.task.target if self.task else self.default_target(sample)
+            self.validate_target(sample)
+            self.timeout = min(self.episode_timeout_s, self.task.timeout_s) if self.task else self.episode_timeout_s
             self.settle_time = self.task.settle_time_s if self.task else 3
             if self.settle_time >= self.timeout:
-                raise ValueError("Settling time must be shorter than the stage-one timeout (maximum 180 seconds)")
+                raise ValueError("Settling time must be shorter than the episode timeout")
             self.reserve = self.task.minimum_fuel_fraction if self.task else 0
             self.started_ut = sample.ut_s
             self.previous = sample
             self.steps, self.throttle = 0, 0
             self.contact = None
             self.done = False
-            ap = self.vessel.auto_pilot
-            ap.reference_frame = self.vessel.surface_reference_frame
-            ap.target_pitch_and_heading(90, 90)
-            ap.engaged = True
+            self.configure_attitude()
             return self.observation(sample), {"target": asdict(self.target)}
         except BaseException:
             self.done = True
@@ -145,13 +188,8 @@ class LandingEnv(gym.Env):
         if self.done:
             raise RuntimeError("Reset the environment before stepping")
         try:
-            action = np.asarray(action, dtype=float)
-            if action.shape != (1,) or not np.isfinite(action).all():
-                raise ValueError("Expected one finite throttle action")
             self.steps += 1
-            # Alignment is an explicit safety intervention, never an autopilot burn.
-            self.throttle = 0 if self.contact is not None or self.previous.tilt_deg > 15 else float(np.clip(action[0], 0, 1))
-            self.vessel.control.throttle = self.throttle
+            self.apply_policy_action(action)
             deadline = time.monotonic() + 3
             while True:
                 time.sleep(.05)
@@ -163,7 +201,7 @@ class LandingEnv(gym.Env):
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Landing simulation stopped advancing")
-            reward, terms = transition_reward(self.previous, sample, self.target)
+            reward, terms = self.reward_transition(self.previous, sample)
             reason, success = None, False
             if not sample.intact:
                 reason = "vessel_damaged"
@@ -184,14 +222,14 @@ class LandingEnv(gym.Env):
                 self.throttle = 0
             elif self.contact is not None:
                 reason = "bounced_after_touchdown"
-            elif sample.height_m > 1500 or sample.vertical_mps > 20 or sample.tilt_deg > 45:
+            elif self.outside_envelope(sample):
                 reason = "outside_training_envelope"
             elif sample.fuel_fraction < max(.001, self.reserve) or sample.acceleration_mps2 <= sample.gravity_mps2:
                 reason = "insufficient_fuel_or_thrust"
             if sample.fuel_fraction < self.reserve:
                 reason = "fuel_reserve_violated"
                 success = False
-            timed_out = sample.ut_s - self.started_ut >= self.timeout or self.steps >= 3000
+            timed_out = sample.ut_s - self.started_ut >= self.timeout or self.steps >= self.maximum_steps
             terminated = reason is not None
             truncated = timed_out and not terminated
             if truncated:
@@ -203,7 +241,7 @@ class LandingEnv(gym.Env):
             info = {**terms, "is_success": success, "reason": reason or "running",
                     "height_m": sample.height_m, "vertical_mps": sample.vertical_mps,
                     "fuel_fraction": sample.fuel_fraction, "applied_throttle": self.throttle,
-                    "alignment_intervention": self.previous.tilt_deg > 15,
+                    "alignment_intervention": self.alignment_intervention(),
                     "touchdown": self.contact}
             self.previous = sample
             self.done = terminated or truncated

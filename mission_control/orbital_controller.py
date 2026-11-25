@@ -1,7 +1,7 @@
 """Apsis maneuver state machine with bounded PID throttle control."""
 
-from .commands import MissionTask, OrbitTarget, TaskType, number
-from .orbits import OrbitElements, apsis_delta_v, burn_duration, plan_orbit_change
+from .commands import DeorbitTarget, MissionTask, OrbitTarget, TaskType, number
+from .orbits import OrbitElements, apsis_delta_v, burn_duration, plan_deorbit, plan_orbit_change
 from .supervisor import ControlCommand, FlightState
 
 
@@ -56,13 +56,23 @@ class OrbitalManeuverController:
         self.burns_started = 0
         self.center_ut = None
 
+    task_type = TaskType.CHANGE_ORBIT
+    target_type = OrbitTarget
+
+    def plan(self, elements, target):
+        return plan_orbit_change(elements, target)
+
+    def check_envelope(self, state):
+        if state.periapsis_m <= 70_000 or state.altitude_m <= 70_000:
+            raise RuntimeError("Maneuver left the safe orbital envelope")
+
     def start(self, task: MissionTask, state: FlightState):
-        if task.task != TaskType.CHANGE_ORBIT or not isinstance(task.target, OrbitTarget):
-            raise ValueError("This controller only accepts change_orbit tasks")
+        if task.task != self.task_type or not isinstance(task.target, self.target_type):
+            raise ValueError(f"This controller only accepts {self.task_type.value} tasks")
         if state.body != "Kerbin" or state.situation != "orbiting":
             raise ValueError("Start in a Kerbin orbit")
         elements = elements_from_state(state)
-        burns = plan_orbit_change(elements, task.target)
+        burns = self.plan(elements, task.target)
         self.task = task
         self.phase = "planning"
         self.burn = None
@@ -85,8 +95,7 @@ class OrbitalManeuverController:
 
     def update(self, state: FlightState) -> ControlCommand:
         elements = elements_from_state(state)
-        if state.periapsis_m <= 70_000 or state.altitude_m <= 70_000:
-            raise RuntimeError("Maneuver left the safe orbital envelope")
+        self.check_envelope(state)
         dt = state.ut_s - self._last_ut
         if dt <= 0:
             raise RuntimeError("Orbital telemetry time did not advance")
@@ -98,7 +107,7 @@ class OrbitalManeuverController:
         self._last_ut = state.ut_s
         orbital = state.orbital
         if self.burn is None:
-            plan = plan_orbit_change(elements, self.task.target)
+            plan = self.plan(elements, self.task.target)
             if not plan:
                 self.phase = "settling"
                 return ControlCommand()
@@ -162,3 +171,17 @@ class OrbitalManeuverController:
             "changed_apsis": self.burn.changed_apsis if self.burn else None,
             "burn_center_ut": getattr(self, "center_ut", None),
         }
+
+
+class DeorbitController(OrbitalManeuverController):
+    """Explicit deorbit task; ordinary change_orbit keeps its atmospheric guard."""
+
+    task_type = TaskType.DEORBIT
+    target_type = DeorbitTarget
+
+    def plan(self, elements, target):
+        return plan_deorbit(elements, target)
+
+    def check_envelope(self, state):
+        if state.altitude_m <= 70_000 or state.periapsis_m < 0:
+            raise RuntimeError("Deorbit burn must finish above the atmosphere with positive periapsis")

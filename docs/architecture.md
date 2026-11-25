@@ -8,10 +8,11 @@ The mission supervisor requires both the vessel altitude and periapsis to be
 strictly above 70 km before declaring an orbital goal reached. A target at the
 boundary does not relax that physical check.
 
-The initial landing task begins in a prepared descending state below 10 km above
-terrain. It does not initiate a return from orbit. Deorbit and atmospheric-return
-preparation must be added before a complete orbital landing mission can run.
-Landing coordinates in the example are illustrative, not a surveyed safe site.
+The generic supervisor's initial landing task begins below 10 km above terrain.
+The separate return coordinator now runs an explicit deorbit task and a
+telemetry-gated handoff to descent PPO v2, with a configurable entry profile up
+to 30 km in the example. It does not use the generic 10 km landing adapter.
+Landing coordinates in examples are illustrative, not surveyed safe sites.
 
 ## Mission lifecycle
 
@@ -60,9 +61,9 @@ The orbital kRPC adapter samples the bound vessel using the correct reference
 frames. Orbital velocity and alignment use a body-centered non-rotating frame;
 surface velocities use the rotating body frame, and tilt uses a local surface
 frame. Samples are sequential RPC reads, not atomic physics-tick snapshots.
-The future landing adapter must record touchdown speeds at contact and retain
-them during settling; zero velocity after a hard impact is not evidence of a
-safe landing. Missing contact-speed data prevents landing success.
+The landing environments retain pre-contact sampled speeds and contact data
+during settling; zero velocity after a hard impact is not evidence of a safe
+landing. RPC samples cannot measure impact peaks between reads.
 
 Mission timeouts use simulation time. The supervisor consumes samples supplied
 by a caller. The orbital runner rejects gaps greater than two simulation seconds
@@ -103,6 +104,14 @@ into a live controller, then add a single kRPC actuator and telemetry adapter.
 Never give the legacy environment and supervisor concurrent control. The new
 orbital controller already uses the supervisor and a single kRPC actuator;
 automatic launch-to-orbit-controller handoff remains to be implemented.
+
+`scripts.return_to_ground` uses the orbital actuator/supervisor for deorbit,
+then owns passive coast attitude at zero throttle. It explicitly calls `stop()`
+before `DescentEnv.begin_current()` takes control of the same vessel. It never
+calls training reset during a live handoff. The descent Gym environment currently
+acts as the PPO inference bridge and owns its own kRPC writes; it is not a generic
+`Controller` implementation. These phases run sequentially, never concurrently.
+See [return and descent](return-and-descent.md) for the model contract and limits.
 
 The launch policy's current observation has 16 values. Changes to its shape,
 ordering, normalization, action meaning, or scripted guard behavior require a

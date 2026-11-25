@@ -44,7 +44,8 @@ The commander chooses goals; the flight controllers choose flight actions.
 | Launch PPO environment | First experimental weights released; reported deterministic evaluation passed 6/6 reference-vessel missions |
 | Apoapsis PPO experiment | Raising-only specialist, consolidated into one implementation; not the planned orbital controller |
 | Orbital maneuver planner / PID | Prototype implemented; offline finite-burn tests passed; first user-reported live 102 x 81 km to 150 x 120 km maneuver succeeded within 1 km tolerances |
-| Landing environment and PPO | Initial throttle-only descent training runner implemented; prepared save and live validation pending; no landing weights yet |
+| Landing environment and PPO | Vertical v1 plus directed-descent v2 training runners; no trained landing weights yet |
+| Deorbit and landing handoff | Explicit deorbit task, telemetry/braking gate, descent-save capture and PPO inference runner implemented; live validation pending |
 | AI commander | Planned; a person can already write the same JSON command format |
 | Complete launch–maneuver–land mission | Planned |
 
@@ -284,7 +285,42 @@ does not establish 1 km accuracy in KSP.
 See [the orbital controller design](docs/orbital-maneuvers.md) for limitations,
 timing behavior, and the first live test procedure.
 
-### Phase 3: vertical powered-landing PPO
+### Phase 3: deorbit and descent PPO
+
+The return runner lowers periapsis (the example targets 20 km), coasts with
+engines off, then hands control to the new descent PPO when actual descending
+altitude, velocity and estimated braking margin fit its configured entry range.
+Periapsis plans the return; it does not trigger the handoff by itself.
+
+The new v2 policy learns throttle and thrust direction from real descent saves.
+It has 26 observations and three actions; the old vertical policy is incompatible.
+There are no trained v2 weights yet. Start with a read-only plan, then explicitly
+capture a descent training state from the current orbit:
+
+```powershell
+python -m scripts.return_to_ground
+python -m scripts.return_to_ground --execute --capture-handoff descent_training_start
+```
+
+Capture performs a real deorbit and saves at a valid handoff; it does not land or
+pause the game. Use a recoverable orbital backup and a suitable powered-return
+craft. A 20 km periapsis does not guarantee atmospheric survival or a dry landing
+site; thermal/site/propellant feasibility is not predicted by this prototype.
+
+Then check and train from that saved descent:
+
+```powershell
+python -m scripts.descent_train check
+python -m scripts.descent_train train
+```
+
+No manual slowdown to 10-20 m/s is required for this policy. It learns from
+recoverable descent states and can sample multiple prepared saves. Train and
+evaluate before attempting the full PPO return. See the
+[return setup, handoff contract and training instructions](docs/return-and-descent.md).
+Live return performance remains unverified.
+
+### Optional vertical landing curriculum (v1)
 
 The first landing curriculum learns throttle while autopilot holds the rocket
 upright. Prepare a separate **`landing_training_start`** save during descent,
@@ -377,6 +413,8 @@ the interrupted simulator trajectory is not guaranteed.
 - `scripts/test_orbit.py`: deterministic launch evaluation.
 - `scripts/orbit_maneuver.py`: read-only orbital plans and explicit live execution.
 - `scripts/landing_train.py`: initial vertical landing PPO checks, training and evaluation.
+- `scripts/descent_train.py`: v2 directed-descent PPO training and evaluation.
+- `scripts/return_to_ground.py`: deorbit, coast, capture or live PPO handoff.
 - `scripts/apoapsis_brain.py`: canonical legacy apoapsis experiment.
 - `tests/`: offline contract, supervisor, and training regression tests.
 - `data_train/`: existing flight recordings; not PPO checkpoints and not consumed

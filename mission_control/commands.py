@@ -9,6 +9,7 @@ from typing import Any
 class TaskType(str, Enum):
     REACH_ORBIT = "reach_orbit"
     CHANGE_ORBIT = "change_orbit"
+    DEORBIT = "deorbit"
     LAND = "land"
 
 
@@ -44,6 +45,16 @@ class OrbitTarget:
 
 
 @dataclass(frozen=True)
+class DeorbitTarget:
+    periapsis_m: float = 20_000.0
+    periapsis_tolerance_m: float = 500.0
+
+    def __post_init__(self):
+        number(self.periapsis_m, "periapsis_m", 1_000, 65_000)
+        number(self.periapsis_tolerance_m, "periapsis_tolerance_m", 1, 1_000)
+
+
+@dataclass(frozen=True)
 class LandingTarget:
     latitude_deg: float
     longitude_deg: float
@@ -65,7 +76,7 @@ class LandingTarget:
 class MissionTask:
     task_id: str
     task: TaskType
-    target: OrbitTarget | LandingTarget
+    target: OrbitTarget | LandingTarget | DeorbitTarget
     schema_version: int = 1
     body: str = "Kerbin"
     minimum_fuel_fraction: float = 0.02
@@ -82,7 +93,7 @@ class MissionTask:
             raise ValueError("The first mission profile supports Kerbin only")
         if not isinstance(self.task, TaskType):
             raise ValueError("task must be a TaskType")
-        target_type = LandingTarget if self.task == TaskType.LAND else OrbitTarget
+        target_type = target_class(self.task)
         if not isinstance(self.target, target_type):
             raise ValueError(f"{self.task.value} requires {target_type.__name__}")
         number(self.minimum_fuel_fraction, "minimum_fuel_fraction", 0, 0.15)
@@ -96,10 +107,10 @@ class MissionTask:
         try:
             kind = TaskType(data["task"])
         except (ValueError, TypeError) as exc:
-            raise ValueError("task must be reach_orbit, change_orbit, or land") from exc
-        target_type = LandingTarget if kind == TaskType.LAND else OrbitTarget
+            raise ValueError("task must be reach_orbit, change_orbit, deorbit, or land") from exc
+        target_type = target_class(kind)
         required = ({"latitude_deg", "longitude_deg"} if kind == TaskType.LAND
-                    else {"apoapsis_m", "periapsis_m"})
+                    else {"periapsis_m"} if kind == TaskType.DEORBIT else {"apoapsis_m", "periapsis_m"})
         fields(data["target"], set(target_type.__dataclass_fields__), required, "target")
         return cls(**{**data, "task": kind, "target": target_type(**data["target"])})
 
@@ -121,3 +132,7 @@ class MissionTask:
             "min_fuel_fraction": self.minimum_fuel_fraction,
             "urgency": self.urgency,
         }
+
+
+def target_class(kind):
+    return {TaskType.LAND: LandingTarget, TaskType.DEORBIT: DeorbitTarget}.get(kind, OrbitTarget)

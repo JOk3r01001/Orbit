@@ -10,8 +10,8 @@ import sys
 import time
 
 from mission_control.commands import MissionTask, TaskType, number
-from mission_control.orbital_controller import OrbitalManeuverController, elements_from_state
-from mission_control.orbits import OrbitalTelemetry, STANDARD_GRAVITY, burn_duration, plan_orbit_change
+from mission_control.orbital_controller import DeorbitController, OrbitalManeuverController, elements_from_state
+from mission_control.orbits import OrbitalTelemetry, STANDARD_GRAVITY, burn_duration, plan_deorbit, plan_orbit_change
 from mission_control.supervisor import FlightState, MissionSupervisor, Status
 
 
@@ -24,14 +24,14 @@ def read_snapshot(path):
 
 
 def plan_report(task, state):
-    if task.task != TaskType.CHANGE_ORBIT:
-        raise ValueError("This runner accepts change_orbit missions only")
+    if task.task not in {TaskType.CHANGE_ORBIT, TaskType.DEORBIT}:
+        raise ValueError("This runner accepts change_orbit or deorbit missions only")
     if state.body != task.body or state.situation != "orbiting":
         raise ValueError("The current vessel must be orbiting the requested body")
     if state.fuel_fraction < task.minimum_fuel_fraction:
         raise ValueError("The current fuel reserve is already below the request")
     elements = elements_from_state(state)
-    burns = plan_orbit_change(elements, task.target)
+    burns = plan_deorbit(elements, task.target) if task.task == TaskType.DEORBIT else plan_orbit_change(elements, task.target)
     orbital = state.orbital
     mass = orbital.mass_kg
     result = []
@@ -59,8 +59,8 @@ def run_live(task, adapter, interval_s=0.2, log_dir=Path("training_output/maneuv
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     telemetry_path = log_dir / f"maneuver_{stamp}.jsonl"
     report_path = log_dir / f"maneuver_{stamp}.json"
-    controller = OrbitalManeuverController()
-    supervisor = MissionSupervisor({TaskType.CHANGE_ORBIT: controller}, adapter)
+    controller = DeorbitController() if task.task == TaskType.DEORBIT else OrbitalManeuverController()
+    supervisor = MissionSupervisor({task.task: controller}, adapter)
     initial = adapter.read()
     initial_plan = plan_report(task, initial)
     interrupted = False

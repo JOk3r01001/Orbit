@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import math
 
-from .commands import OrbitTarget, number
+from .commands import DeorbitTarget, OrbitTarget, number
 
 STANDARD_GRAVITY = 9.80665
 MINIMUM_MANEUVER_PERIAPSIS_M = 71_000.0
@@ -157,3 +157,13 @@ def burn_duration(delta_v_mps, mass_kg, thrust_n, specific_impulse_s):
     exhaust_velocity = specific_impulse_s * STANDARD_GRAVITY
     burned_mass = mass_kg * -math.expm1(-abs(delta_v_mps) / exhaust_velocity)
     return burned_mass * exhaust_velocity / thrust_n
+
+
+def plan_deorbit(elements: OrbitElements, target: DeorbitTarget):
+    """Lower osculating periapsis at apoapsis; no entry/site prediction."""
+    if abs(elements.periapsis_m - target.periapsis_m) <= target.periapsis_tolerance_m:
+        return []
+    if elements.periapsis_m < target.periapsis_m:
+        raise ValueError("Deorbit overshot the target; refusing a recovery burn")
+    return [ApsisBurn("apoapsis", "periapsis", target.periapsis_m,
+                      apsis_delta_v(elements, "periapsis", target.periapsis_m), target.periapsis_tolerance_m)]
