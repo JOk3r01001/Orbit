@@ -6,6 +6,7 @@ import time
 
 from .commands import number
 from .orbits import OrbitalTelemetry
+from .recovery import RecoverySample
 from .supervisor import ControlCommand, FlightState
 
 
@@ -145,6 +146,28 @@ class KRPCOrbitalAdapter:
         )
         self._assert_bound()
         return FlightState(ut_s=float(self.space_center.ut), **values)
+
+    def read_recovery(self, parts, chutes, flight):
+        """Read surface telemetry independently of the vessel's engine or orbit."""
+        self._assert_bound()
+        situation = self.vessel.situation.name
+        intact = parts.issubset(self.vessel.parts.all)
+        states = tuple(chute.state.name for chute in chutes) if intact else ()
+        values = dict(
+            situation=situation,
+            height_m=float(flight.surface_altitude), vertical_mps=float(flight.vertical_speed),
+            horizontal_mps=float(flight.horizontal_speed), latitude_deg=float(flight.latitude),
+            longitude_deg=float(flight.longitude), intact=intact, chute_states=states,
+        )
+        self._assert_bound()
+        return RecoverySample(ut_s=float(self.space_center.ut), **values)
+
+    def deploy_parachute_if_safe(self, chute):
+        self._assert_bound()
+        if chute.state.name != "stowed" or chute.safe_state.name != "safe":
+            return False
+        chute.deploy()
+        return True
 
     def apply(self, command: ControlCommand):
         self._assert_bound()

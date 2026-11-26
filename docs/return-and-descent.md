@@ -1,5 +1,9 @@
 # Deorbit, telemetry handoff and descent PPO v2
 
+This is the experimental powered-descent path. The v1 default is
+[parachute recovery](parachute-return.md). Use `--powered` for a preview of the
+powered experiment. Passing `--capture-handoff` or `--model` selects it as well.
+
 The return prototype implements this sequence on the currently loaded Kerbin
 vessel:
 
@@ -76,7 +80,7 @@ thermal protection and propellant arrangement manually.
 Read-only preview (no engine/autopilot writes):
 
 ```powershell
-python -m scripts.return_to_ground
+python -m scripts.return_to_ground --powered
 ```
 
 The preview's `engine_preflight` section shows active-engine available thrust,
@@ -91,7 +95,7 @@ changes and fuel consumption, so it is only diagnostic.
 Offline preview without KSP or flight dependencies:
 
 ```powershell
-python -m scripts.return_to_ground --snapshot examples/telemetry/orbit_snapshot.json
+python -m scripts.return_to_ground --powered --snapshot examples/telemetry/orbit_snapshot.json
 ```
 
 There are no trained descent-v2 weights yet. Explicit capture mode performs the

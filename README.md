@@ -1,7 +1,8 @@
 # Orbit: autonomous KSP mission control
 
 Build a flight system that accepts a mission from a person or an AI commander,
-launches a rocket into orbit, changes that orbit, and lands using engine thrust.
+launches a rocket into orbit, changes that orbit, and returns to Kerbin under
+parachutes.
 
 > **First model weights available:** The experimental launch PPO checkpoint is
 > available in [launch-v0.1.0](https://github.com/JOk3r01001/Orbit/releases/tag/launch-v0.1.0),
@@ -10,9 +11,9 @@ launches a rocket into orbit, changes that orbit, and lands using engine thrust.
 > controller weights will be published as their training goals are achieved.
 
 The first vehicle profile is a single rocket on stock Kerbin, launching eastward
-into an 80–180 km apoapsis orbit. Powered landing will start with a throttleable
-engine and prepared descent states. Other bodies, arbitrary inclinations,
-detached-booster recovery, and full atmospheric return are later extensions.
+into an 80–180 km apoapsis orbit. V1 uses a trained launch PPO, a deterministic
+orbital controller, and scripted parachute recovery. Powered landing remains
+an experiment for a later version.
 
 ## Architecture
 
@@ -22,7 +23,7 @@ flowchart TD
     Task --> Supervisor[Mission supervisor]
     Supervisor --> Launch[Launch PPO]
     Supervisor --> Maneuver[Orbital planner and PID / autopilot]
-    Supervisor --> Landing[Landing PPO]
+    Supervisor --> Landing[Deorbit and parachute recovery]
     Launch --> Actuator[One owner of vessel controls]
     Maneuver --> Actuator
     Landing --> Actuator
@@ -31,23 +32,22 @@ flowchart TD
     Telemetry --> Supervisor
 ```
 
-There are three control stages, initially using two PPO policies and a
-deterministic orbital controller. A third PPO policy is optional future research.
-The commander chooses goals; the flight controllers choose flight actions.
+Launch, orbit changes, and return have separate entry points. The return runner
+automatically transitions from the deorbit burn to parachute recovery.
 
 ## Implementation status
 
 | Component | Current state |
 | --- | --- |
 | Structured mission commands | Implemented, with offline validation and examples |
-| Mission supervisor | Coordination core plus live orbital adapter; launch/landing adapters remain pending |
+| Mission supervisor | Coordinates orbital burns; the return runner owns entry and recovery after deorbit |
 | Launch PPO environment | First experimental weights released; reported deterministic evaluation passed 6/6 reference-vessel missions |
 | Apoapsis PPO experiment | Raising-only specialist, consolidated into one implementation; not the planned orbital controller |
 | Orbital maneuver planner / PID | Prototype implemented; offline finite-burn tests passed; first user-reported live 102 x 81 km to 150 x 120 km maneuver succeeded within 1 km tolerances |
-| Landing environment and PPO | Vertical v1 plus directed-descent v2 training runners; no trained landing weights yet |
-| Deorbit and landing handoff | Explicit deorbit task, telemetry/braking gate, descent-save capture and PPO inference runner implemented; live validation pending |
+| V1 return | Deorbit and stock parachute recovery implemented with offline tests; first complete KSP flight pending |
+| Powered landing research | Separate vertical and directed-descent PPO training runners |
 | AI commander | Planned; a person can already write the same JSON command format |
-| Complete launch–maneuver–land mission | Planned |
+| Launch to recovery | Run launch, orbit changes, and return in sequence on the same craft |
 
 Launch model weights are distributed as GitHub release assets, separately from
 the source tree. KSP craft files and training saves are not included. Offline
@@ -87,7 +87,7 @@ To resume training, place the downloaded model at the repository root with its
 original filename, preserving a backup of any existing model, then run
 `python -m scripts.orbit_command`. A compatible craft and save are required;
 changing the vessel may require evaluation and fine-tuning. Staging remains
-scripted. Orbital-maneuver and landing weights are not yet available.
+scripted. Orbital maneuvers and parachute recovery use deterministic control.
 
 ## Try the commander interface without KSP
 
@@ -273,8 +273,9 @@ aborts and requests cutoff. Reports and JSONL telemetry are written under
 The fuel fraction for this standalone phase is relative to the LiquidFuel
 present when the orbital adapter connects. It is not the original launch fuel
 fraction and does not prove sufficient delta-v. Integrated whole-mission fuel
-budgeting remains future work. Inclination changes, transfers, deorbit, orbital
-staging, and automatic launch-to-maneuver handoff are not implemented.
+budgeting remains future work. The return runner uses a separate deorbit task.
+Inclination changes, transfers, orbital staging, and automatic
+launch-to-maneuver handoff are future work.
 
 Offline checks include independent energy/angular-momentum verification of
 impulse plans, PID anti-windup, transport deadlines, cleanup, and finite-thrust
@@ -285,63 +286,36 @@ does not establish 1 km accuracy in KSP.
 See [the orbital controller design](docs/orbital-maneuvers.md) for limitations,
 timing behavior, and the first live test procedure.
 
-### Phase 3: deorbit and descent PPO
+### Phase 3: deorbit and parachute recovery
 
-The return runner lowers periapsis (the example targets 20 km), coasts with
-engines off, then hands control to the new descent PPO when actual descending
-altitude, velocity and estimated braking margin fit its configured entry range.
-Periapsis plans the return; it does not trigger the handoff by itself.
-
-The new v2 policy learns throttle and thrust direction from real descent saves.
-It has 26 observations and three actions; the old vertical policy is incompatible.
-There are no trained v2 weights yet. Start with a read-only plan, then explicitly
-capture a descent training state from the current orbit:
+Load a stable Kerbin orbit with an active deorbit engine and enough propellant
+for the burn. Equip the returning craft with stowed stock parachutes sized for
+its return mass and suitable thermal protection. Keep throttle at zero and warp
+at normal speed. Preview the mission and check that `parachute_states` lists
+the expected stowed chutes:
 
 ```powershell
 python -m scripts.return_to_ground
-python -m scripts.return_to_ground --execute --capture-handoff descent_training_start
+python -m scripts.return_to_ground --execute
 ```
 
-Capture performs a real deorbit and saves at a valid handoff; it does not land or
-pause the game. Use a recoverable orbital backup and a suitable powered-return
-craft. A 20 km periapsis does not guarantee atmospheric survival or a dry landing
-site; thermal/site/propellant feasibility is not predicted by this prototype.
+The second command flies the mission. The example targets a 20 km periapsis,
+then coasts at zero throttle. The runner deploys each chute during descent
+when KSP reports it safe. Success requires a fully open canopy observed before
+contact, an intact vessel, and a settled landing or splashdown within the
+configured speed limits. Reports are saved under `training_output/returns/`.
+Save a recoverable orbital backup before the first flight.
 
-Then check and train from that saved descent:
+See [Parachute recovery](docs/parachute-return.md) for the configuration,
+limitations, and validation steps. The first full recovery flight in KSP is
+still pending.
 
-```powershell
-python -m scripts.descent_train check
-python -m scripts.descent_train train
-```
+### Powered landing research
 
-No manual slowdown to 10-20 m/s is required for this policy. It learns from
-recoverable descent states and can sample multiple prepared saves. Train and
-evaluate before attempting the full PPO return. See the
-[return setup, handoff contract and training instructions](docs/return-and-descent.md).
-Live return performance remains unverified.
-
-### Optional vertical landing curriculum (v1)
-
-The first landing curriculum learns throttle while autopilot holds the rocket
-upright. Prepare a separate **`landing_training_start`** save during descent,
-preferably 300-500 m above flat dry ground at 10-20 m/s downward, with horizontal
-speed below 0.5 m/s. Keep a throttleable engine active, throttle zero, landing
-legs deployed and parachutes stowed. Available thrust/weight must be at least
-1.3. This save is reloaded every episode; the orbital save cannot be used here.
-
-```powershell
-python -m scripts.landing_train check
-python -m scripts.landing_train train
-```
-
-The check actively controls the vessel with random actions. Training starts a
-new landing policy or resumes `training_output/landing_v1/landing_latest.zip`.
-Periodic checkpoints are saved every 5,000 steps, and Ctrl+C saves current
-parameters. Keep each checkpoint's matching JSON metadata for resume. This
-curriculum has no lateral steering, deorbit or automatic orbital handoff yet.
-KSP landing performance is unverified until the first descent-save test.
-
-See [landing preparation, rewards, evaluation and resume instructions](docs/landing-training.md).
+The [vertical landing environment](docs/landing-training.md) and the
+[directed-descent PPO](docs/return-and-descent.md) are available for later
+experiments. Settings and checkpoints for those experiments are separate from
+the v1 recovery mission.
 
 ### Legacy apoapsis specialist
 
@@ -371,12 +345,11 @@ raises apoapsis; it does not implement arbitrary maneuvers or deorbit burns.
    remain to be completed. Verify orbit and reserve with engines off.
 3. **Orbital maneuvers:** planner/PID prototype and live runner implemented.
    Validate live burns, measure accuracy and propellant use, connect the launch
-   handoff, then add deorbit planning.
-4. **Powered landing:** begin with low-altitude vertical descents, then introduce
-   horizontal velocity, target location, mass, and thrust variation. Train on
-   states produced by the preceding controller before connecting the stages.
-5. **Complete missions:** connect validated handoffs, add natural-language task
-   translation, and publish reproducible results and failure examples.
+   handoff, and validate the deorbit burn on the return craft.
+4. **V1 recovery:** fly a full return with stock parachutes and record the
+   deployment and touchdown telemetry.
+5. **Later versions:** connect the launch handoff, add natural-language task
+   translation, and revisit powered landing with a suitable craft.
 
 Record success counts, orbit errors, fuel remaining, touchdown speeds, landing
 distance, interventions, and failure reasons. Compare learned policies with
@@ -414,7 +387,7 @@ the interrupted simulator trajectory is not guaranteed.
 - `scripts/orbit_maneuver.py`: read-only orbital plans and explicit live execution.
 - `scripts/landing_train.py`: initial vertical landing PPO checks, training and evaluation.
 - `scripts/descent_train.py`: v2 directed-descent PPO training and evaluation.
-- `scripts/return_to_ground.py`: deorbit, coast, capture or live PPO handoff.
+- `scripts/return_to_ground.py`: deorbit and parachute recovery, with optional powered-descent experiments.
 - `scripts/apoapsis_brain.py`: canonical legacy apoapsis experiment.
 - `tests/`: offline contract, supervisor, and training regression tests.
 - `data_train/`: existing flight recordings; not PPO checkpoints and not consumed

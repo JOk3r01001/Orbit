@@ -8,11 +8,10 @@ The mission supervisor requires both the vessel altitude and periapsis to be
 strictly above 70 km before declaring an orbital goal reached. A target at the
 boundary does not relax that physical check.
 
-The generic supervisor's initial landing task begins below 10 km above terrain.
-The separate return coordinator now runs an explicit deorbit task and a
-telemetry-gated handoff to descent PPO v2, with a configurable entry profile up
-to 30 km in the example. It does not use the generic 10 km landing adapter.
-Landing coordinates in examples are illustrative, not surveyed safe sites.
+The v1 return coordinator runs an explicit deorbit task from stable orbit,
+then uses surface telemetry and the stock parachute safety state for recovery.
+It accepts a dry landing or splashdown under the configured limits. Powered
+landing tasks and target coordinates remain part of the experimental interfaces.
 
 ## Mission lifecycle
 
@@ -30,7 +29,7 @@ After a terminal result, a new task can be submitted using the current vessel's
 telemetry. The supervisor never reloads a save. Each accepted task binds to the
 reported vessel identity and body; a change causes failure and a stop request.
 
-Only `Actuator.apply()` and `Actuator.stop()` own physical control. A controller's
+The actuator owns flight commands and direct stock chute deployment. A controller's
 `start(task, state)` initializes its internal state; `update(state)` returns a
 validated `ControlCommand`. Controllers must not call kRPC directly. Staging is
 permitted only for the launch task. The orbital actuator checks its bound remote
@@ -79,10 +78,10 @@ still uses wall-clock sleeps; its physics-time stepping remains future work.
 For an orbit task, both orbital errors must be within the requested tolerances,
 the orbit must clear the atmosphere, and the fuel reserve must be satisfied.
 
-For landing, require an intact vessel in `landed` state, within the target
-radius, within touchdown and current speed limits, and within the tilt limit.
-The initial distance calculation uses a 600 km spherical Kerbin radius. Splashdown
-is not a successful landing in this first profile.
+For v1 return, require an intact craft, a fully open parachute observed before
+contact, and settled `landed` or permitted `splashed` status within the speed
+limits. The separately defined powered landing goal uses dry-ground contact,
+target radius, speed and tilt limits.
 
 When a candidate goal is observed, command zero throttle and no staging. The goal
 must remain satisfied for `settle_time_s` of simulation time before success. If
@@ -105,13 +104,13 @@ Never give the legacy environment and supervisor concurrent control. The new
 orbital controller already uses the supervisor and a single kRPC actuator;
 automatic launch-to-orbit-controller handoff remains to be implemented.
 
-`scripts.return_to_ground` uses the orbital actuator/supervisor for deorbit,
-then owns passive coast attitude at zero throttle. It explicitly calls `stop()`
-before `DescentEnv.begin_current()` takes control of the same vessel. It never
-calls training reset during a live handoff. The descent Gym environment currently
-acts as the PPO inference bridge and owns its own kRPC writes; it is not a generic
-`Controller` implementation. These phases run sequentially, never concurrently.
-See [return and descent](return-and-descent.md) for the model contract and limits.
+`scripts.return_to_ground` uses the orbital supervisor for the deorbit burn.
+Once that task releases the controls, the runner monitors entry, requests safe
+chute deployment on the same vessel, and records touchdown. The engine stays
+at zero throttle after the deorbit burn. See [parachute return](parachute-return.md).
+The optional powered-descent path uses the same deorbit phase and hands control
+to `DescentEnv.begin_current()` without a training reset. See the
+[experimental model contract](return-and-descent.md).
 
 The launch policy's current observation has 16 values. Changes to its shape,
 ordering, normalization, action meaning, or scripted guard behavior require a

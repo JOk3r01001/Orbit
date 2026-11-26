@@ -1,0 +1,20 @@
+{
+  "deorbit": {
+    "task_id": "parachute-return-001",
+    "task": "deorbit",
+    "target": {"periapsis_m": 20000, "periapsis_tolerance_m": 500},
+    "minimum_fuel_fraction": 0.02,
+    "timeout_s": 7200,
+    "settle_time_s": 3
+  },
+  "recovery": {
+    "entry_attitude": "surface_retrograde",
+    "deploy_above_m": 100,
+    "deploy_below_m": 10000,
+    "max_touchdown_vertical_mps": 8,
+    "max_touchdown_horizontal_mps": 5,
+    "allow_splashdown": true,
+    "settle_time_s": 3,
+    "timeout_s": 7200
+  }
+}
